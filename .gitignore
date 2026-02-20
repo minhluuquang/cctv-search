@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables (sensitive credentials)
+.env
+
+# Extracted frames
+frame_*.png
+test_*.png
+
+# Temporary test scripts
+test_connection.py
+test_extract_frame.py
+test_nvr_diagnose.py
+
+# Documentation files
+nvr.md
+problem-solution.md
