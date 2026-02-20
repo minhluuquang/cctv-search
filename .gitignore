@@ -16,11 +16,6 @@ wheels/
 frame_*.png
 test_*.png
 
-# Temporary test scripts
-test_connection.py
-test_extract_frame.py
-test_nvr_diagnose.py
-
 # Documentation files
 nvr.md
 problem-solution.md
