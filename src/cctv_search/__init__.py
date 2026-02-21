@@ -1,14 +1,17 @@
 """CCTV Search - Main module."""
 
-import uvicorn
+from __future__ import annotations
 
-from cctv_search.api import app
+try:
+    import uvicorn
+    from cctv_search.api import app
 
+    def main():
+        """Run the FastAPI server."""
+        uvicorn.run(app, host="0.0.0.0", port=8000)
 
-def main():
-    """Run the FastAPI server."""
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
+except ImportError:
+    # uvicorn not installed, skip main entry point
+    pass

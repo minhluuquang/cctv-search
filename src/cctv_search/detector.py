@@ -1,17 +1,35 @@
-"""Mock RF-DETR object detector for CCTV search.
+"""RF-DETR object detector integration for CCTV search.
 
-This module provides a mock/stub implementation of RF-DETR detection and
-segmentation for testing and development purposes.
+This module provides the integration layer between RF-DETR (from cctv_search.ai)
+and the search algorithm. It converts RF-DETR detections to the format expected
+by the search algorithm.
+
+RF-DETR Installation:
+    pip install rfdetr
+
+Usage:
+    from cctv_search.detector import RFDetrDetector, Detection, BoundingBox
+    
+    detector = RFDetrDetector()
+    detector.load_model()
+    
+    detections = detector.detect(frame_bytes)
+    for det in detections:
+        print(f"{det.class_label}: {det.confidence:.2f}")
 """
 
 from __future__ import annotations
 
-import random
-from collections.abc import Callable
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -124,175 +142,119 @@ class Detection:
         return ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
 
 
-@dataclass
-class DetectorConfig:
-    """Configuration for mock detector behavior.
-
-    Attributes:
-        default_classes: List of class labels to detect
-        confidence_range: Min/max confidence values to generate
-        default_frame_size: Default frame dimensions (width, height)
-        detection_probability: Probability of detecting an object per frame
-        custom_behavior: Optional callback to customize detection generation
-    """
-
-    default_classes: list[str] = field(
-        default_factory=lambda: ["bicycle", "person", "car", "motorcycle"]
-    )
-    confidence_range: tuple[float, float] = (0.7, 0.99)
-    default_frame_size: tuple[int, int] = (1920, 1080)
-    detection_probability: float = 0.8
-    custom_behavior: Callable[[int, float], list[Detection]] | None = None
-
-
-class MockRFDetrDetector:
-    """Mock RF-DETR detector for testing and development.
-
-    This class simulates the RF-DETR object detection and segmentation model
-    with configurable behavior for testing purposes.
-
+class RFDetrDetector:
+    """RF-DETR detector wrapper for CCTV search.
+    
+    This class wraps the RF-DETR model from cctv_search.ai and provides
+    the Detection interface expected by the search algorithm.
+    
     Example:
-        >>> config = DetectorConfig(detection_probability=0.9)
-        >>> detector = MockRFDetrDetector(config)
-        >>> detections = detector.detect(frame_idx=100, timestamp=5.0)
+        >>> detector = RFDetrDetector()
+        >>> detector.load_model()
+        >>> detections = detector.detect(frame_bytes, frame_idx=100)
+        >>> for det in detections:
+        ...     print(f"{det.class_label}: {det.confidence:.2f}")
     """
-
-    def __init__(self, config: DetectorConfig | None = None):
-        """Initialize the mock detector.
-
+    
+    DEFAULT_CONFIDENCE = 0.5
+    DEFAULT_FRAME_SIZE = (1920, 1080)
+    
+    def __init__(
+        self,
+        confidence_threshold: float = DEFAULT_CONFIDENCE,
+        frame_size: tuple[int, int] = DEFAULT_FRAME_SIZE,
+    ):
+        """Initialize RF-DETR detector.
+        
         Args:
-            config: Configuration for detector behavior
+            confidence_threshold: Minimum confidence for detections
+            frame_size: Frame dimensions (width, height)
         """
-        self.config = config or DetectorConfig()
-        self._rng = random.Random()
-        self._rng.seed(42)
-
-    def set_seed(self, seed: int) -> None:
-        """Set random seed for reproducible detection results.
-
-        Args:
-            seed: Random seed value
+        self.confidence_threshold = confidence_threshold
+        self.frame_size = frame_size
+        self._detector = None
+        self._model_loaded = False
+        
+    def load_model(self) -> None:
+        """Load RF-DETR model.
+        
+        Downloads and initializes the pre-trained RF-DETR model.
         """
-        self._rng.seed(seed)
-
+        try:
+            from cctv_search.ai import RFDetrDetector as AiRFDetrDetector
+            
+            logger.info("Loading RF-DETR model...")
+            self._detector = AiRFDetrDetector(
+                confidence_threshold=self.confidence_threshold
+            )
+            self._detector.load_model()
+            self._model_loaded = True
+            logger.info("RF-DETR model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load RF-DETR: {e}")
+            raise RuntimeError(f"Failed to load RF-DETR: {e}") from e
+    
     def detect(
         self,
-        frame_idx: int,
-        timestamp: float,
-        frame: NDArray[np.uint8] | None = None,
+        frame: bytes,
+        frame_idx: int = 0,
+        timestamp: float = 0.0,
     ) -> list[Detection]:
         """Run detection on a frame.
-
+        
         Args:
-            frame_idx: Frame index in the video
+            frame: Frame data as bytes
+            frame_idx: Frame index in video
             timestamp: Timestamp in seconds
-            frame: Optional frame data (not used in mock, for API compatibility)
-
+            
         Returns:
             List of Detection objects
         """
-        if self.config.custom_behavior:
-            return self.config.custom_behavior(frame_idx, timestamp)
-
-        if self._rng.random() > self.config.detection_probability:
+        if not self._model_loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
+        try:
+            # Run detection with RF-DETR
+            ai_detections = self._detector.detect(frame)
+            
+            # Convert to search algorithm format
+            detections = []
+            width, height = self.frame_size
+            
+            for ai_det in ai_detections:
+                # Create bounding box
+                bbox = BoundingBox(
+                    x1=ai_det.bbox.x,
+                    y1=ai_det.bbox.y,
+                    x2=ai_det.bbox.x + ai_det.bbox.width,
+                    y2=ai_det.bbox.y + ai_det.bbox.height,
+                )
+                
+                # Create mask (rectangle for now, can be improved with segmentation)
+                mask = np.zeros((height, width), dtype=np.bool_)
+                x1_int = max(0, int(bbox.x1))
+                y1_int = max(0, int(bbox.y1))
+                x2_int = min(width, int(bbox.x2))
+                y2_int = min(height, int(bbox.y2))
+                mask[y1_int:y2_int, x1_int:x2_int] = True
+                
+                # Create detection
+                detection = Detection(
+                    bbox=bbox,
+                    mask=mask,
+                    confidence=ai_det.confidence,
+                    class_label=ai_det.label,
+                    frame_idx=frame_idx,
+                    timestamp=timestamp,
+                )
+                detections.append(detection)
+            
+            return detections
+            
+        except Exception as e:
+            logger.error(f"Detection failed: {e}")
             return []
 
-        return self._generate_random_detections(frame_idx, timestamp)
 
-    def _generate_random_detections(
-        self, frame_idx: int, timestamp: float
-    ) -> list[Detection]:
-        """Generate random detections for testing.
-
-        Args:
-            frame_idx: Frame index
-            timestamp: Timestamp in seconds
-
-        Returns:
-            List of generated Detection objects
-        """
-        width, height = self.config.default_frame_size
-
-        num_objects = self._rng.randint(1, 4)
-        detections = []
-
-        for _ in range(num_objects):
-            # Generate random bounding box
-            box_width = self._rng.uniform(50, 200)
-            box_height = self._rng.uniform(50, 200)
-            x1 = self._rng.uniform(0, width - box_width)
-            y1 = self._rng.uniform(0, height - box_height)
-            x2 = x1 + box_width
-            y2 = y1 + box_height
-
-            bbox = BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2)
-
-            # Generate mask (simplified as rectangle for mock)
-            mask = np.zeros((height, width), dtype=np.bool_)
-            mask[int(y1) : int(y2), int(x1) : int(x2)] = True
-
-            confidence = self._rng.uniform(*self.config.confidence_range)
-            class_label = self._rng.choice(self.config.default_classes)
-
-            detection = Detection(
-                bbox=bbox,
-                mask=mask,
-                confidence=confidence,
-                class_label=class_label,
-                frame_idx=frame_idx,
-                timestamp=timestamp,
-            )
-            detections.append(detection)
-
-        return detections
-
-    def detect_with_target(
-        self,
-        frame_idx: int,
-        timestamp: float,
-        target_detection: Detection,
-        appear_probability: float = 0.7,
-        similarity_noise: float = 0.1,
-    ) -> Detection | None:
-        """Generate a detection matching a target (for simulating tracking).
-
-        Args:
-            frame_idx: Frame index
-            timestamp: Timestamp in seconds
-            target_detection: Target detection to simulate
-            appear_probability: Probability that target appears in this frame
-            similarity_noise: Amount of position variation to add
-
-        Returns:
-            Detection matching target if it appears, None otherwise
-        """
-        if self._rng.random() > appear_probability:
-            return None
-
-        # Add some noise to position
-        noise_x = self._rng.uniform(-similarity_noise, similarity_noise) * 50
-        noise_y = self._rng.uniform(-similarity_noise, similarity_noise) * 50
-
-        bbox = BoundingBox(
-            x1=target_detection.bbox.x1 + noise_x,
-            y1=target_detection.bbox.y1 + noise_y,
-            x2=target_detection.bbox.x2 + noise_x,
-            y2=target_detection.bbox.y2 + noise_y,
-        )
-
-        # Copy mask with slight modifications
-        mask = target_detection.mask.copy()
-
-        confidence = min(
-            1.0,
-            target_detection.confidence + self._rng.uniform(-0.05, 0.05),
-        )
-
-        return Detection(
-            bbox=bbox,
-            mask=mask,
-            confidence=confidence,
-            class_label=target_detection.class_label,
-            frame_idx=frame_idx,
-            timestamp=timestamp,
-        )
+# Backward compatibility
+MockRFDetrDetector = RFDetrDetector

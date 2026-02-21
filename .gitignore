@@ -15,3 +15,6 @@ wheels/
 # Extracted frames
 frame_*.png
 test_*.png
+
+# models
+rf-detr-base.pth
