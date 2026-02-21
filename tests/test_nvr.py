@@ -70,8 +70,9 @@ def test_build_rtsp_url(nvr_client):
 
     url = nvr_client._build_rtsp_url(1, start_time, end_time)
 
+    # Per Dahua spec, credentials are NOT in the URL
     expected = (
-        "rtsp://admin:password123@192.168.1.100:554"
+        "rtsp://192.168.1.100:554"
         "/cam/playback?channel=1&starttime=2026_02_19_22_31_05&endtime=2026_02_19_22_31_06"
     )
     assert url == expected

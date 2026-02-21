@@ -15,7 +15,3 @@ wheels/
 # Extracted frames
 frame_*.png
 test_*.png
-
-# Documentation files
-nvr.md
-problem-solution.md

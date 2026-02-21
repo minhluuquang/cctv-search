@@ -28,6 +28,7 @@ def test_health_check_implicit(client):
 def test_extract_frame_endpoint(mock_nvr_client, client):
     """Test frame extraction endpoint."""
     from pathlib import Path
+
     mock_nvr_client.extract_frame.return_value = Path("/tmp/frame.png")
 
     timestamp = datetime(2026, 2, 19, 22, 31, 5)
