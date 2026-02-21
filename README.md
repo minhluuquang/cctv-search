@@ -1,12 +1,14 @@
 # CCTV Search
 
-A FastAPI-based server for searching CCTV footage using AI object detection.
+A FastAPI-based server for searching CCTV footage using AI object detection and tracking.
 
 ## Architecture
 
 - **FastAPI Server**: HTTP API for video management and AI analysis
-- **NVR Module**: Connect to Network Video Recorders (Hikvision support)
-- **AI Module**: Object detection using YOLO models
+- **NVR Module**: Connect to Network Video Recorders (Dahua/Hikvision support)
+- **AI Module**: Object detection using RF-DETR models
+- **Tracker Module**: Multi-object tracking across video frames
+- **Search Module**: Video search and indexing capabilities
 
 ## Requirements
 
@@ -29,7 +31,7 @@ source .venv/bin/activate
 # Run the server
 uv run cctv-search
 
-# Or with uvicorn directly
+# Or with uvicorn directly (with reload)
 uv run uvicorn cctv_search.api:app --reload
 ```
 
@@ -51,7 +53,7 @@ uv run uvicorn cctv_search.api:app --reload
 uv run pytest
 
 # Run a single test
-uv run pytest tests/test_nvr.py::test_nvr_client_connects_successfully -v
+uv run pytest tests/test_nvr.py::test_nvr_client_init_with_params -v
 
 # Lint code
 uv run ruff check .
@@ -76,20 +78,32 @@ uv add --dev <package>
 ├── pyproject.toml         # Project configuration
 ├── uv.lock               # Dependency lock file
 ├── README.md
+├── AGENTS.md             # AI coding agent guidelines
 ├── src/
 │   └── cctv_search/
 │       ├── __init__.py      # Main entry point
 │       ├── api/             # FastAPI routes
-│       │   └── __init__.py
-│       ├── nvr/             # NVR client modules
-│       │   ├── __init__.py
-│       │   └── hikvision.py
-│       └── ai/              # AI/ML modules
-│           ├── __init__.py
-│           └── yolo.py
-└── tests/
-    ├── test_placeholder.py
-    ├── test_nvr.py
-    ├── test_ai.py
-    └── test_api.py
+│       ├── nvr/             # NVR client modules (Dahua/Hikvision)
+│       ├── ai/              # AI/ML modules (RF-DETR detection)
+│       ├── search/          # Video search functionality
+│       └── tracker.py       # Object tracking
+├── tests/                   # Test suite
+│   ├── test_nvr.py
+│   ├── test_ai.py
+│   ├── test_api.py
+│   └── ...
+└── scripts/                 # Utility scripts
 ```
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
+```bash
+NVR_HOST=192.168.1.100
+NVR_PORT=554
+NVR_USERNAME=admin
+NVR_PASSWORD=password
+```
+
+See `AGENTS.md` for detailed coding guidelines.

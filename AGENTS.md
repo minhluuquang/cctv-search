@@ -23,10 +23,10 @@ uv add --dev <package>
 uv run pytest
 
 # Run a single test file
-uv run pytest tests/test_example.py
+uv run pytest tests/test_nvr.py
 
 # Run a single test function
-uv run pytest tests/test_example.py::test_function_name
+uv run pytest tests/test_nvr.py::test_nvr_client_init_with_params -v
 
 # Run with verbose output
 uv run pytest -v
@@ -47,16 +47,19 @@ uv run ruff check . --fix
 uv run ruff format .
 
 # Check specific file
-uv run ruff check src/cctv_search/module.py
+uv run ruff check src/cctv_search/nvr/hikvision.py
 ```
 
 ### Running the Application
 ```bash
-# Run the CLI
+# Run the CLI (FastAPI server)
 uv run cctv-search
 
-# Run a Python script
-uv run python src/cctv_search/__init__.py
+# Run with uvicorn directly (with reload)
+uv run uvicorn cctv_search.api:app --reload
+
+# Run a specific script
+uv run python test_connection.py
 ```
 
 ## Code Style Guidelines

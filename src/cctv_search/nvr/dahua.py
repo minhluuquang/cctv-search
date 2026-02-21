@@ -128,3 +128,71 @@ class DahuaNVRClient:
             raise RuntimeError(f"Failed to extract frame: {e.stderr}") from e
 
         return output_path
+
+    def extract_clip(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        channel: int = 1,
+        output_path: str | Path = "clip.mp4",
+    ) -> Path:
+        """Extract a video clip from start_time to end_time.
+
+        Uses ffmpeg to extract the clip from the RTSP playback stream.
+
+        Args:
+            start_time: Start timestamp for the clip
+            end_time: End timestamp for the clip
+            channel: Camera channel number (default: 1)
+            output_path: Path to save the extracted clip
+
+        Returns:
+            Path to the extracted video file
+
+        Raises:
+            RuntimeError: If ffmpeg fails to extract the clip
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build RTSP URL for the time range
+        rtsp_url = self._build_rtsp_url(channel, start_time, end_time)
+
+        # URL-encode username and password to handle special characters
+        encoded_username = urllib.parse.quote(self.username, safe="")
+        encoded_password = urllib.parse.quote(self.password, safe="")
+        auth_url = rtsp_url.replace(
+            f"rtsp://{self.host}:{self.port}",
+            f"rtsp://{encoded_username}:{encoded_password}@{self.host}:{self.port}",
+        )
+
+        # Calculate duration for ffmpeg -t option
+        duration_seconds = int((end_time - start_time).total_seconds())
+
+        cmd = [
+            "ffmpeg",
+            "-rtsp_transport",
+            self.rtsp_transport,
+            "-i",
+            auth_url,
+            "-t",
+            str(duration_seconds),
+            "-c:v",
+            "copy",  # Copy video codec without re-encoding (faster)
+            "-c:a",
+            "copy",  # Copy audio codec without re-encoding
+            "-y",  # Overwrite output file if exists
+            str(output_path),
+        ]
+
+        try:
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to extract clip: {e.stderr}") from e
+
+        return output_path

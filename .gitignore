@@ -18,3 +18,9 @@ test_*.png
 
 # models
 rf-detr-base.pth
+
+# Generated video clips
+clips/
+
+# Generated annotated frames
+frames/
