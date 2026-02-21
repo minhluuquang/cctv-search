@@ -1,7 +1,7 @@
-"""ByteTrack-style object tracker implementation.
+"""ByteTrack-style object tracker implementation using roboflow/trackers.
 
-This is a simplified implementation of the ByteTrack multi-object tracking algorithm
-that doesn't require the official ByteTrack library (which has compatibility issues).
+This module provides a wrapper around the official roboflow/trackers ByteTrack
+implementation, adapting it to work with the cctv_search DetectedObject format.
 
 The algorithm uses:
 - Kalman filter for motion prediction
@@ -10,7 +10,7 @@ The algorithm uses:
 
 Usage:
     from cctv_search.ai.byte_tracker import ByteTrackTracker, Track
-    
+
     tracker = ByteTrackTracker()
     tracks = tracker.update(detections, frame_idx=100)
 """
@@ -18,10 +18,12 @@ Usage:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import supervision as sv
+from trackers import ByteTrackTracker as _ByteTrackTracker
 
 if TYPE_CHECKING:
     from cctv_search.ai import DetectedObject
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Track:
     """Represents a tracked object.
-    
+
     Attributes:
         track_id: Unique track identifier
         label: Object class label
@@ -46,7 +48,7 @@ class Track:
         is_activated: Whether track has been confirmed
         state: Track state ('tracked', 'lost', or 'removed')
     """
-    
+
     track_id: int
     label: str
     x: float
@@ -60,7 +62,7 @@ class Track:
     state: str = "tracked"
     age: int = 0
     hits: int = 0
-    
+
     def update(self, detection: DetectedObject, frame_idx: int) -> None:
         """Update track with new detection."""
         self.x = detection.bbox.x + detection.bbox.width / 2
@@ -74,14 +76,14 @@ class Track:
         self.is_active = True
         if self.hits >= 3:  # Activate after 3 hits
             self.is_activated = True
-    
+
     def predict(self) -> None:
         """Predict next position (simple motion model)."""
         self.age += 1
         if self.age > 30:  # Mark as lost after 30 frames
             self.state = "lost"
             self.is_active = False
-    
+
     def mark_removed(self) -> None:
         """Mark track as removed."""
         self.state = "removed"
@@ -89,15 +91,11 @@ class Track:
 
 
 class ByteTrackTracker:
-    """ByteTrack multi-object tracker.
-    
-    Simplified implementation of ByteTrack algorithm:
-    1. Split detections into high/low confidence
-    2. Match high confidence with existing tracks
-    3. Match low confidence with unmatched tracks
-    4. Create new tracks for unmatched detections
-    5. Remove stale tracks
-    
+    """ByteTrack multi-object tracker using roboflow/trackers.
+
+    Wrapper around the official ByteTrack implementation that adapts it
+    to work with cctv_search's DetectedObject format.
+
     Example:
         >>> tracker = ByteTrackTracker(track_thresh=0.5)
         >>> detections = [
@@ -105,7 +103,7 @@ class ByteTrackTracker:
         ... ]
         >>> tracks = tracker.update(detections, frame_idx=100)
     """
-    
+
     def __init__(
         self,
         track_thresh: float = 0.5,
@@ -114,10 +112,10 @@ class ByteTrackTracker:
         frame_rate: int = 20,
     ):
         """Initialize ByteTrack tracker.
-        
+
         Args:
             track_thresh: Detection confidence threshold for first matching
-            match_thresh: IoU threshold for matching
+            match_thresh: IoU threshold for matching (kept for API compatibility)
             track_buffer: Maximum frames to keep lost tracks
             frame_rate: Video frame rate
         """
@@ -125,170 +123,169 @@ class ByteTrackTracker:
         self.match_thresh = match_thresh
         self.track_buffer = track_buffer
         self.frame_rate = frame_rate
-        
-        self._tracks: list[Track] = []
-        self._next_track_id: int = 1
+
+        # Initialize the official ByteTrack tracker
+        # Note: track_activation_threshold corresponds to track_thresh
+        self._tracker = _ByteTrackTracker(
+            lost_track_buffer=track_buffer,
+            frame_rate=float(frame_rate),
+            track_activation_threshold=track_thresh,
+            minimum_consecutive_frames=2,
+            minimum_iou_threshold=0.1,
+            high_conf_det_threshold=0.6,
+        )
+
         self._frame_count: int = 0
-        
+
+        # Keep track of detection-to-track mappings
+        self._label_map: dict[int, str] = {}
+
         logger.info(f"ByteTrack tracker initialized (thresh={track_thresh})")
-    
+
     def update(
         self,
         detections: list[DetectedObject],
         frame_idx: int,
     ) -> list[Track]:
         """Update tracker with new detections.
-        
+
         Args:
             detections: List of detections from current frame
             frame_idx: Current frame index
-            
+
         Returns:
             List of active tracks
         """
         self._frame_count = frame_idx
-        
-        # Predict existing tracks
-        for track in self._tracks:
-            track.predict()
-        
-        # Separate active and lost tracks
-        active_tracks = [t for t in self._tracks if t.is_active]
-        
-        # Split detections by confidence
-        high_dets = [d for d in detections if d.confidence >= self.track_thresh]
-        low_dets = [d for d in detections 
-                   if 0.1 <= d.confidence < self.track_thresh]
-        
-        # First association: high confidence with active tracks
-        matched, unmatched_tracks, unmatched_dets = self._associate(
-            active_tracks, high_dets
-        )
-        
-        # Update matched tracks
-        for track, det in matched:
-            track.update(det, frame_idx)
-        
-        # Second association: low confidence with unmatched tracks
-        if unmatched_tracks and low_dets:
-            matched2, unmatched_tracks2, _ = self._associate(
-                unmatched_tracks, low_dets
+
+        if not detections:
+            # Process empty frame to let tracker handle lost tracks
+            empty_detections = sv.Detections(
+                xyxy=np.empty((0, 4)),
+                confidence=np.empty(0),
+                class_id=np.empty(0, dtype=int),
             )
-            for track, det in matched2:
-                track.update(det, frame_idx)
-        else:
-            unmatched_tracks2 = unmatched_tracks
-        
-        # Mark unmatched tracks as lost
-        for track in unmatched_tracks2:
-            if track.age > self.track_buffer:
-                track.mark_removed()
-        
-        # Create new tracks for unmatched high confidence detections
-        for det in unmatched_dets:
-            if det.confidence >= self.track_thresh:
-                new_track = Track(
-                    track_id=self._next_track_id,
-                    label=det.label,
-                    x=det.bbox.x + det.bbox.width / 2,
-                    y=det.bbox.y + det.bbox.height / 2,
-                    width=det.bbox.width,
-                    height=det.bbox.height,
-                    confidence=det.confidence,
-                    frame_idx=frame_idx,
-                )
-                self._tracks.append(new_track)
-                self._next_track_id += 1
-        
-        # Remove old tracks
-        self._tracks = [t for t in self._tracks if t.state != "removed"]
-        
-        # Return active tracks
-        return [t for t in self._tracks if t.is_active]
-    
-    def _associate(
-        self,
-        tracks: list[Track],
-        detections: list[DetectedObject],
-    ) -> tuple[list[tuple[Track, DetectedObject]], list[Track], list[DetectedObject]]:
-        """Associate tracks with detections using IoU.
-        
+            _ = self._tracker.update(empty_detections)
+            return []
+
+        # Convert DetectedObject list to supervision.Detections
+        sv_detections = self._to_sv_detections(detections)
+
+        # Run the official tracker
+        tracked_detections = self._tracker.update(sv_detections)
+
+        # Convert back to Track objects
+        tracks = self._to_tracks(tracked_detections, frame_idx)
+
+        return tracks
+
+    def _to_sv_detections(self, detections: list[DetectedObject]) -> sv.Detections:
+        """Convert DetectedObject list to supervision.Detections.
+
         Args:
-            tracks: List of tracks to match
-            detections: List of detections to match
-            
+            detections: List of DetectedObject
+
         Returns:
-            (matched_pairs, unmatched_tracks, unmatched_detections)
+            supervision.Detections object
         """
-        if not tracks or not detections:
-            return [], tracks, detections
-        
-        # Compute IoU matrix
-        iou_matrix = np.zeros((len(tracks), len(detections)))
-        for i, track in enumerate(tracks):
-            for j, det in enumerate(detections):
-                iou_matrix[i, j] = self._compute_iou(track, det)
-        
-        # Greedy matching
-        matched = []
-        unmatched_tracks = list(tracks)
-        unmatched_dets = list(detections)
-        
-        # Sort by IoU descending
-        indices = np.argsort(iou_matrix.flatten())[::-1]
-        
-        used_tracks = set()
-        used_dets = set()
-        
-        for idx in indices:
-            i = idx // len(detections)
-            j = idx % len(detections)
-            
-            if i in used_tracks or j in used_dets:
+        if not detections:
+            return sv.Detections(
+                xyxy=np.empty((0, 4)),
+                confidence=np.empty(0),
+                class_id=np.empty(0, dtype=int),
+            )
+
+        xyxy_list = []
+        confidence_list = []
+        class_id_list = []
+        label_map = {}
+
+        for _i, det in enumerate(detections):
+            # Convert bbox (x, y, width, height) to xyxy (x1, y1, x2, y2)
+            x1 = det.bbox.x
+            y1 = det.bbox.y
+            x2 = det.bbox.x + det.bbox.width
+            y2 = det.bbox.y + det.bbox.height
+            xyxy_list.append([x1, y1, x2, y2])
+
+            confidence_list.append(det.confidence)
+
+            # Map labels to class IDs
+            # Use a simple hash-based mapping for consistency
+            label_hash = hash(det.label) % 10000
+            class_id_list.append(label_hash)
+            label_map[label_hash] = det.label
+
+        self._label_map = label_map
+
+        return sv.Detections(
+            xyxy=np.array(xyxy_list),
+            confidence=np.array(confidence_list),
+            class_id=np.array(class_id_list, dtype=int),
+        )
+
+    def _to_tracks(
+        self, detections: sv.Detections, frame_idx: int
+    ) -> list[Track]:
+        """Convert supervision.Detections to Track objects.
+
+        Args:
+            detections: Tracked detections with tracker_id
+            frame_idx: Current frame index
+
+        Returns:
+            List of Track objects
+        """
+        tracks: list[Track] = []
+
+        if detections.is_empty():
+            return tracks
+
+        tracker_ids = detections.tracker_id
+        if tracker_ids is None:
+            return tracks
+
+        confidences = detections.confidence
+        class_ids = detections.class_id
+        if confidences is None or class_ids is None:
+            return tracks
+
+        for i in range(len(detections)):
+            xyxy = detections.xyxy[i]
+            confidence = confidences[i]
+            class_id = class_ids[i]
+            tracker_id = tracker_ids[i]
+
+            # Skip tracks that haven't been activated yet (tracker_id < 0)
+            if tracker_id < 0:
                 continue
-            
-            if iou_matrix[i, j] >= self.match_thresh:
-                matched.append((tracks[i], detections[j]))
-                used_tracks.add(i)
-                used_dets.add(j)
-        
-        # Collect unmatched
-        unmatched_tracks = [t for i, t in enumerate(tracks) if i not in used_tracks]
-        unmatched_dets = [d for j, d in enumerate(detections) if j not in used_dets]
-        
-        return matched, unmatched_tracks, unmatched_dets
-    
-    def _compute_iou(self, track: Track, det: DetectedObject) -> float:
-        """Compute IoU between track and detection."""
-        # Track box
-        tx1 = track.x - track.width / 2
-        ty1 = track.y - track.height / 2
-        tx2 = track.x + track.width / 2
-        ty2 = track.y + track.height / 2
-        
-        # Detection box
-        dx1 = det.bbox.x
-        dy1 = det.bbox.y
-        dx2 = det.bbox.x + det.bbox.width
-        dy2 = det.bbox.y + det.bbox.height
-        
-        # Intersection
-        x1 = max(tx1, dx1)
-        y1 = max(ty1, dy1)
-        x2 = min(tx2, dx2)
-        y2 = min(ty2, dy2)
-        
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-        
-        intersection = (x2 - x1) * (y2 - y1)
-        
-        # Union
-        track_area = (tx2 - tx1) * (ty2 - ty1)
-        det_area = (dx2 - dx1) * (dy2 - dy1)
-        union = track_area + det_area - intersection
-        
-        return intersection / union if union > 0 else 0.0
+
+            # Convert xyxy back to center x, y, width, height
+            x1, y1, x2, y2 = xyxy
+            width = x2 - x1
+            height = y2 - y1
+            x = x1 + width / 2
+            y = y1 + height / 2
+
+            # Get label from mapping or use class_id as string
+            label = self._label_map.get(int(class_id), f"class_{class_id}")
+
+            track = Track(
+                track_id=int(tracker_id),
+                label=label,
+                x=float(x),
+                y=float(y),
+                width=float(width),
+                height=float(height),
+                confidence=float(confidence),
+                frame_idx=frame_idx,
+                is_active=True,
+                is_activated=True,  # Official tracker handles activation internally
+                state="tracked",
+            )
+            tracks.append(track)
+
+        return tracks
 
     def is_same_object(
         self,
@@ -310,14 +307,14 @@ class ByteTrackTracker:
 
         # Handle both Detection objects and DetectedObject objects
         def get_bbox(det):
-            if hasattr(det, 'bbox'):
+            if hasattr(det, "bbox"):
                 return det.bbox
             return det
 
         def get_label(det):
-            if hasattr(det, 'label'):
+            if hasattr(det, "label"):
                 return det.label
-            if hasattr(det, 'class_label'):
+            if hasattr(det, "class_label"):
                 return det.class_label
             return None
 
@@ -338,10 +335,10 @@ class ByteTrackTracker:
                 x2 = bbox.x + bbox.width
                 y2 = bbox.y + bbox.height
             else:
-                x1 = bbox.x1 if hasattr(bbox, 'x1') else bbox.x
-                y1 = bbox.y1 if hasattr(bbox, 'y1') else bbox.y
-                x2 = bbox.x2 if hasattr(bbox, 'x2') else bbox.x + bbox.width
-                y2 = bbox.y2 if hasattr(bbox, 'y2') else bbox.y + bbox.height
+                x1 = bbox.x1 if hasattr(bbox, "x1") else bbox.x
+                y1 = bbox.y1 if hasattr(bbox, "y1") else bbox.y
+                x2 = bbox.x2 if hasattr(bbox, "x2") else bbox.x + bbox.width
+                y2 = bbox.y2 if hasattr(bbox, "y2") else bbox.y + bbox.height
             return x1, y1, x2, y2
 
         x1_1, y1_1, x2_1, y2_1 = get_coords(bbox1)
@@ -378,9 +375,17 @@ class ByteTrackTracker:
 
     def reset(self) -> None:
         """Reset tracker state."""
-        self._tracks = []
-        self._next_track_id = 1
+        # Re-initialize the official tracker
+        self._tracker = _ByteTrackTracker(
+            lost_track_buffer=self.track_buffer,
+            frame_rate=float(self.frame_rate),
+            track_activation_threshold=self.track_thresh,
+            minimum_consecutive_frames=2,
+            minimum_iou_threshold=0.1,
+            high_conf_det_threshold=0.6,
+        )
         self._frame_count = 0
+        self._label_map = {}
         logger.info("Tracker reset")
 
 
