@@ -24,6 +24,8 @@ __all__ = [
     "BoundingBox",
     "DetectedObject",
     "RFDetrDetector",
+    "ByteTrackTracker",
+    "Track",
     "ObjectDetector",
 ]
 
@@ -78,3 +80,6 @@ class ObjectDetector(Protocol):
 
 # Import RF-DETR detector after defining types to avoid circular imports
 from cctv_search.ai.rf_detr import RFDetrDetector
+
+# Import ByteTrack tracker
+from cctv_search.ai.byte_tracker import ByteTrackTracker, Track
