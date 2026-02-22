@@ -12,15 +12,16 @@ from cctv_search.nvr import DahuaNVRClient
 def test_live_stream():
     """Test live stream endpoint."""
     client = DahuaNVRClient()
-    
+
     # Dahua live stream URL format
     live_url = f"rtsp://{client.username}:{client.password}@{client.host}:{client.port}/cam/realmonitor?channel=1&subtype=0"
-    
+
     print(f"Testing LIVE STREAM:")
-    print(f"URL: rtsp://{client.username}:****@{client.host}:{client.port}/cam/realmonitor?channel=1&subtype=0")
-    
+    print(
+        f"URL: rtsp://{client.username}:****@{client.host}:{client.port}/cam/realmonitor?channel=1&subtype=0")
+
     import subprocess
-    
+
     cmd = [
         "ffmpeg",
         "-rtsp_transport", "tcp",
@@ -30,9 +31,10 @@ def test_live_stream():
         "-y",
         "test_live_frame.png",
     ]
-    
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             print("✓ LIVE STREAM WORKS!")
             print(f"  Frame saved: test_live_frame.png")
@@ -54,11 +56,11 @@ def test_live_stream():
 def test_playback_now():
     """Test playback with current time."""
     client = DahuaNVRClient()
-    
+
     # Use current time
     now = datetime.now()
     print(f"\nTesting PLAYBACK with current time: {now}")
-    
+
     try:
         result = client.extract_frame(
             timestamp=now,
@@ -77,16 +79,16 @@ if __name__ == "__main__":
     print("=" * 60)
     print("NVR Connection Test")
     print("=" * 60)
-    
+
     live_works = test_live_stream()
     playback_works = test_playback_now()
-    
+
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
     print(f"Live Stream: {'✓ WORKS' if live_works else '✗ FAILED'}")
     print(f"Playback: {'✓ WORKS' if playback_works else '✗ FAILED'}")
-    
+
     if not live_works and not playback_works:
         print("\nBoth failed. Possible causes:")
         print("  - Wrong NVR brand (not Dahua)")
