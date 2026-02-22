@@ -68,6 +68,24 @@ class DahuaNVRClient:
             f"/cam/playback?channel={channel}&starttime={start_str}&endtime={end_str}"
         )
 
+    def _build_rtsp_url_with_auth(
+        self, channel: int, start_time: datetime, end_time: datetime
+    ) -> str:
+        """Build RTSP playback URL with authentication.
+
+        Returns URL with credentials embedded for direct playback:
+        rtsp://<user>:<pass>@<server>:[port]/cam/playback?channel=<channel>&starttime=<YYYY_MM_DD_HH_MM_SS>&endtime=<YYYY_MM_DD_HH_MM_SS>
+        """
+        from urllib.parse import quote
+        encoded_username = quote(self.username, safe='')
+        encoded_password = quote(self.password, safe='')
+        start_str = self._format_timestamp(start_time)
+        end_str = self._format_timestamp(end_time)
+        return (
+            f"rtsp://{encoded_username}:{encoded_password}@{self.host}:{self.port}"
+            f"/cam/playback?channel={channel}&starttime={start_str}&endtime={end_str}"
+        )
+
     def extract_frame(
         self,
         timestamp: datetime,

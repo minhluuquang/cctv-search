@@ -23,6 +23,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Configure logging to show INFO level logs
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+class FrameExtractionError(Exception):
+    """Raised when frame extraction from video source fails.
+
+    This exception indicates that the NVR or video source is unavailable
+    or the requested timestamp does not have recorded footage.
+    """
+    pass
+
+
 # Default search parameters
 DEFAULT_FPS = 20.0
 DEFAULT_MIN_WINDOW = 5  # 5 seconds precision
@@ -242,9 +263,8 @@ def backward_search(
     """Backward frame-based search with adaptive sampling.
 
     Optimized for 20 FPS cameras using:
-    1. Phase 1: Coarse sampling (30 second steps)
-    2. Phase 2: Medium sampling (5 second steps)
-    3. Phase 3: Frame-level binary search (exact frame)
+    1. Phase 1: Coarse sampling (300 second / 5 minute steps)
+    2. Phase 2: Binary search (finds exact boundary within 5 seconds)
 
     Args:
         target_time: Unix timestamp where target object is visible
@@ -258,6 +278,7 @@ def backward_search(
     Returns:
         SearchResult with status and timestamp if found
     """
+    logger.info(f"backward_search STARTED target_time={target_time}")
     # Validate configuration
     min_window = config.get("min_window", DEFAULT_MIN_WINDOW)
     max_lookback = config.get("max_lookback", DEFAULT_MAX_LOOKBACK)
@@ -272,8 +293,7 @@ def backward_search(
     seconds_to_frames = int(fps_float)
 
     # Step sizes in frames
-    coarse_step = 30 * seconds_to_frames  # 30 seconds = 600 frames @ 20fps
-    medium_step = 5 * seconds_to_frames   # 5 seconds = 100 frames @ 20fps
+    coarse_step = 300 * seconds_to_frames  # 300 seconds = 6000 frames @ 20fps
 
     # Calculate frame indices
     frame_at_target = video_source.timestamp_to_frame(target_time)
@@ -293,10 +313,24 @@ def backward_search(
         nonlocal iterations
         iterations += 1
 
-        # Get frame
+        # Get frame with timestamp for logging
+        frame_timestamp = video_source.frame_to_timestamp(frame_idx)
+        frame_dt = datetime.fromtimestamp(frame_timestamp)
+        logger.info(
+            f"[check_frame] Frame {frame_idx} ({frame_dt.isoformat()}) - "
+            f"iteration {iterations}"
+        )
+
         frame = video_source.get_frame_by_index(frame_idx)
         if frame is None:
-            return False
+            timestamp = video_source.frame_to_timestamp(frame_idx)
+            dt = datetime.fromtimestamp(timestamp)
+            raise FrameExtractionError(
+                f"Frame extraction failed at frame {frame_idx} "
+                f"(timestamp: {dt.isoformat()}). "
+                f"Check NVR connectivity and ensure recordings exist for "
+                f"this time period."
+            )
 
         # Run detection
         detections = detector.detect(frame)
@@ -310,135 +344,126 @@ def backward_search(
 
         return False
 
-    # === PHASE 1: Coarse Sampling (30 second steps) ===
-    logger.debug("Phase 1: Coarse sampling (30 second steps)")
+    try:
+        # === PHASE 1: Coarse Sampling (300 second / 5 minute steps) ===
+        logger.debug("Phase 1: Coarse sampling (30 second steps)")
 
-    step = coarse_step
-    current_frame = frame_at_target
-    last_known_frame = frame_at_target
-    found_any = False
-
-    # Check if object at T
-    if check_frame(frame_at_target):
-        found_any = True
+        step = coarse_step
+        current_frame = frame_at_target
         last_known_frame = frame_at_target
+        found_any = False
 
-    # Coarse search backward - always search full range even if not at T
-    while step > 0 and current_frame - step >= frame_limit:
-        check_idx = current_frame - step
+        # Check if object at T
+        if check_frame(frame_at_target):
+            found_any = True
+            last_known_frame = frame_at_target
 
-        if check_frame(check_idx):
-            # Object found here
-            if not found_any:
-                # First time finding the object - this is our starting point
-                found_any = True
-                last_known_frame = check_idx
-                current_frame = check_idx
-                step = coarse_step  # Reset to standard step for fine search
+        # Coarse search backward - always search full range even if not at T
+        while step > 0 and current_frame - step >= frame_limit:
+            check_idx = current_frame - step
+
+            if check_frame(check_idx):
+                # Object found here
+                if not found_any:
+                    # First time finding the object - this is our starting point
+                    found_any = True
+                    last_known_frame = check_idx
+                    current_frame = check_idx
+                    step = coarse_step  # Reset to standard step for fine search
+                else:
+                    # Object still here from previous search
+                    last_known_frame = check_idx
+                    current_frame = check_idx
+                    step *= 2  # Accelerate backward
             else:
-                # Object still here from previous search
-                last_known_frame = check_idx
-                current_frame = check_idx
-                step *= 2  # Accelerate backward
-        else:
-            if found_any:
-                # Found gap after having found object!
-                logger.debug(
-                    f"Phase 1: Gap found between frames {check_idx} "
-                    f"and {last_known_frame}"
-                )
-                break
+                if found_any:
+                    # Found gap after having found object!
+                    logger.debug(
+                        f"Phase 1: Gap found between frames {check_idx} "
+                        f"and {last_known_frame}"
+                    )
+                    break
+                else:
+                    # Haven't found object yet, continue searching
+                    current_frame = check_idx
+                    # Keep same step size to continue searching
+
+            # Safety check
+            if step > max_frames_back:
+                step = max_frames_back
+
+        # If we never found the object, return NOT_FOUND
+        if not found_any:
+            logger.info("Object not found in coarse search")
+            return SearchResult(
+                status=SearchStatus.NOT_FOUND,
+                iterations=iterations,
+                message="Object not found",
+            )
+
+        # If we reached the limit without finding a gap
+        if current_frame - step < frame_limit:
+            # Object exists all the way to the limit
+            result_time = video_source.frame_to_timestamp(frame_limit)
+            logger.info(f"Object exists to limit, returning frame {frame_limit}")
+            return SearchResult(
+                status=SearchStatus.SUCCESS,
+                timestamp=result_time,
+                precision_seconds=min_window,
+                confidence=getattr(target_object, "confidence", None),
+                iterations=iterations,
+                message=f"Object found at frame {frame_limit}",
+            )
+
+        # === PHASE 2: Binary Search (find exact boundary) ===
+        logger.debug("Phase 2: Binary search to find exact boundary")
+
+        # Search range from Phase 1
+        left = current_frame - step   # No object here (gap_start)
+        right = last_known_frame      # Object here (gap_end)
+        
+        # Target precision: 5 seconds in frames
+        precision_frames = int(5 * fps_float)
+        
+        logger.debug(f"Binary search range: frames {left} to {right} ({right - left} frames)")
+        
+        # Binary search to find exact boundary within 5-second precision
+        while right - left > precision_frames:
+            mid = (left + right) // 2
+            
+            if check_frame(mid):
+                # Object exists, move left boundary
+                right = mid
             else:
-                # Haven't found object yet, continue searching
-                current_frame = check_idx
-                # Keep same step size to continue searching
-
-        # Safety check
-        if step > max_frames_back:
-            step = max_frames_back
-
-    # If we never found the object, return NOT_FOUND
-    if not found_any:
-        logger.info("Object not found in coarse search")
-        return SearchResult(
-            status=SearchStatus.NOT_FOUND,
-            iterations=iterations,
-            message="Object not found",
+                # No object, move right boundary
+                left = mid
+        
+        # 'left' is now within 5 seconds of the first appearance boundary
+        result_frame = left
+        result_time = video_source.frame_to_timestamp(result_frame)
+        frames_before = frame_at_target - result_frame
+        
+        logger.info(
+            f"Search complete. Found at frame {result_frame} (T-{frames_before} frames) "
+            f"with {right - left} frame precision"
         )
 
-    # If we reached the limit without finding a gap
-    if current_frame - step < frame_limit:
-        # Object exists all the way to the limit
-        result_time = video_source.frame_to_timestamp(frame_limit)
-        logger.info(f"Object exists to limit, returning frame {frame_limit}")
         return SearchResult(
             status=SearchStatus.SUCCESS,
             timestamp=result_time,
-            precision_seconds=min_window,
+            precision_seconds=5.0,
             confidence=getattr(target_object, "confidence", None),
             iterations=iterations,
-            message=f"Object found at frame {frame_limit}",
+            message=f"Object found at frame {result_frame}",
         )
 
-    # === PHASE 2: Medium Sampling (5 second steps) ===
-    logger.debug("Phase 2: Medium sampling (5 second steps)")
-
-    # Search range from Phase 1
-    gap_start = current_frame - step  # No object here
-    gap_end = last_known_frame         # Object here
-
-    # Scan backward with 5-second steps
-    check_idx = gap_end
-    while check_idx > gap_start:
-        check_idx -= medium_step
-
-        if check_idx < gap_start:
-            check_idx = gap_start
-
-        if check_frame(check_idx):
-            # Object still here, continue
-            pass
-        else:
-            # Found the gap at this level
-            gap_start = check_idx
-            gap_end = check_idx + medium_step
-            logger.debug(f"Phase 2: Gap narrowed to frames {gap_start}-{gap_end}")
-            break
-
-    # === PHASE 3: Frame-Level Binary Search ===
-    logger.debug("Phase 3: Frame-level binary search")
-
-    left = gap_start   # No object
-    right = gap_end    # Has object
-
-    # Binary search to find exact boundary (within 1 frame)
-    while right - left > 1:
-        mid = (left + right) // 2
-
-        if check_frame(mid):
-            # Object exists, look earlier
-            right = mid
-        else:
-            # No object, look later
-            left = mid
-
-    # 'right' is the first frame with object
-    result_frame = right
-    result_time = video_source.frame_to_timestamp(result_frame)
-
-    frames_before = frame_at_target - result_frame
-    logger.info(
-        f"Search complete. Found at frame {result_frame} (T-{frames_before} frames)"
-    )
-
-    return SearchResult(
-        status=SearchStatus.SUCCESS,
-        timestamp=result_time,
-        precision_seconds=min_window,
-        confidence=getattr(target_object, "confidence", None),
-        iterations=iterations,
-        message=f"Object found at frame {result_frame}",
-    )
+    except FrameExtractionError as e:
+        logger.error(f"[ERROR] Search aborted due to frame extraction failure: {e}")
+        return SearchResult(
+            status=SearchStatus.ERROR,
+            message=str(e),
+            iterations=iterations,
+        )
 
 
 class BackwardTemporalSearch:
@@ -468,6 +493,7 @@ class BackwardTemporalSearch:
         target_detection: ObjectDetection,
     ) -> SearchResult:
         """Execute backward frame-based search."""
+        logger.info("BackwardTemporalSearch.search() CALLED")
         config = {
             "initial_window": int(self.INITIAL_WINDOW_MINUTES * 60),
             "min_window": self.MIN_WINDOW_SECONDS,

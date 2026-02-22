@@ -18,9 +18,16 @@ from cctv_search.nvr import DahuaNVRClient
 
 logger = logging.getLogger(__name__)
 
-# Configuration for mock mode - can be set via environment variable
-# Set MOCK_SEARCH_MODE=false to use real NVR integration
-MOCK_SEARCH_MODE = os.getenv("MOCK_SEARCH_MODE", "true").lower() in ("true", "1", "yes")
+# Configure logging to show INFO level logs
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # Global state
 nvr_client: DahuaNVRClient | None = None
@@ -161,6 +168,7 @@ class ObjectSearchResult(BaseModel):
     track_duration_seconds: float | None
     clip_path: str | None  # Path to generated video clip (if found)
     image_path: str | None  # Path to annotated frame image at first appearance
+    play_command: str | None  # Full ffplay command to view the 15s clip
 
 
 class ObjectSearchResponse(BaseModel):
@@ -309,62 +317,181 @@ def annotate_frame_with_objects(
         raise RuntimeError(f"Failed to annotate frame: {e}") from e
 
 
-def _create_mock_annotated_image(objects: list[DetectedObjectWithId]) -> bytes:
-    """Create a mock annotated image for testing without AI models.
+def annotate_video_clip(
+    video_path: Path,
+    output_path: Path,
+    detector,
+    tracker,
+    target_label: str,
+    target_bbox: dict[str, float],
+    fps: float = 20.0,
+) -> None:
+    """Annotate video clip with bounding boxes around the searched object.
 
     Args:
-        objects: List of mock objects to display.
-
-    Returns:
-        PNG image bytes with mock annotations.
+        video_path: Path to input video file.
+        output_path: Path to save annotated video.
+        detector: Object detector instance.
+        tracker: Object tracker instance.
+        target_label: Label of the object to highlight (e.g., "person").
+        target_bbox: Initial bounding box of the target object to match.
+        fps: Video frame rate.
     """
-    from PIL import Image, ImageDraw, ImageFont
-
-    # Create a blank test image
-    img = Image.new("RGB", (640, 480), color=(50, 50, 50))
-    draw = ImageDraw.Draw(img)
-
     try:
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
-        title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
-    except OSError:
-        font = ImageFont.load_default()
-        title_font = font
+        import cv2
 
-    # Draw title
-    draw.text(
-        (20, 20),
-        "Mock Annotated Frame (AI Model Not Loaded)",
-        fill=(255, 255, 255),
-        font=title_font,
-    )
+        # Open video
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
 
-    # Draw mock objects
-    for i, obj in enumerate(objects):
-        y_offset = 80 + i * 60
-        x = 50 + (i % 3) * 180
-        y = y_offset
-        width = 120
-        height = 80
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or fps
 
-        # Draw bounding box
-        draw.rectangle([x, y, x + width, y + height], outline=(0, 255, 0), width=2)
+        # Setup video writer
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(str(output_path), fourcc, video_fps, (width, height))
 
-        # Draw label
-        label_text = f"ID:{obj.object_id} {obj.label}"
-        draw.text((x, y - 20), label_text, fill=(0, 255, 0), font=font)
+        # Color palette
+        colors = {
+            "person": (0, 255, 0),      # Green
+            "bicycle": (255, 0, 0),     # Blue
+            "car": (0, 0, 255),         # Red
+            "motorcycle": (255, 255, 0), # Cyan
+            "bus": (255, 0, 255),       # Magenta
+            "truck": (0, 255, 255),     # Yellow
+        }
 
-        # Draw mock object representation
-        draw.text(
-            (x + 10, y + 30),
-            f"{obj.confidence:.2f}",
-            fill=(0, 255, 0),
-            font=font,
-        )
+        frame_idx = 0
+        target_track_id = None
+        logger.info(f"Annotating video: {total_frames} frames to process")
 
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    return buffer.getvalue()
+        # Reset tracker for fresh tracking session
+        tracker.reset()
+        logger.info("Tracker reset for video annotation")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Encode frame for detector
+            _, buffer = cv2.imencode(".jpg", frame)
+            frame_bytes = buffer.tobytes()
+
+            # Detect objects
+            detections = detector.detect(frame_bytes)
+
+            # Update tracker
+            tracks = tracker.update(detections, frame_idx)
+
+            # Find target track on first frame using bbox matching
+            if frame_idx == 0 and tracks:
+                # Calculate target center
+                target_cx = target_bbox["x"] + target_bbox["width"] / 2
+                target_cy = target_bbox["y"] + target_bbox["height"] / 2
+
+                # Find track with closest center to target bbox
+                best_track = None
+                best_distance = float("inf")
+
+                for track in tracks:
+                    if track.is_active and track.label == target_label:
+                        cx = track.x
+                        cy = track.y
+                        distance = ((cx - target_cx) ** 2 + (cy - target_cy) ** 2) ** 0.5
+
+                        if distance < best_distance:
+                            best_distance = distance
+                            best_track = track
+
+                if best_track and best_distance < 100:  # Within 100 pixels
+                    target_track_id = best_track.track_id
+                    logger.info(f"Target track identified: ID {target_track_id} "
+                                f"(distance: {best_distance:.1f}px)")
+
+            # Find target track in current frame
+            target_track = None
+            if target_track_id is not None:
+                for track in tracks:
+                    if track.is_active and track.track_id == target_track_id:
+                        target_track = track
+                        break
+
+            # Draw bounding boxes
+            if target_track:
+                # Get target bounding box (Track stores x, y, width, height directly)
+                x1 = int(target_track.x - target_track.width / 2)
+                y1 = int(target_track.y - target_track.height / 2)
+                x2 = int(target_track.x + target_track.width / 2)
+                y2 = int(target_track.y + target_track.height / 2)
+
+                # Get color for target
+                color = colors.get(target_label.lower(), (0, 255, 0))
+
+                # Draw thick bounding box for target
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+                # Draw label with background
+                label = f"ID:{target_track.track_id} {target_label}"
+                (text_w, text_h), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+                )
+
+                # Label background
+                cv2.rectangle(
+                    frame,
+                    (x1, y1 - text_h - 8),
+                    (x1 + text_w + 8, y1),
+                    color,
+                    -1,
+                )
+
+                # Label text
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1 + 4, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
+
+            # Add timestamp overlay
+            timestamp_text = f"Frame: {frame_idx}"
+            cv2.putText(
+                frame,
+                timestamp_text,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
+
+            # Write frame
+            out.write(frame)
+            frame_idx += 1
+
+            # Progress logging every 50 frames
+            if frame_idx % 50 == 0:
+                progress = (frame_idx / total_frames) * 100
+                logger.info(f"  Annotating: {frame_idx}/{total_frames} frames ({progress:.1f}%)")
+
+        # Cleanup
+        cap.release()
+        out.release()
+
+        logger.info(f"Annotated video saved: {output_path}")
+
+    except ImportError:
+        logger.warning("OpenCV not available, skipping video annotation")
+    except Exception as e:
+        logger.warning(f"Failed to annotate video: {e}")
 
 
 @app.post("/frames/objects", response_model=FrameObjectsResponse)
@@ -394,8 +521,9 @@ async def get_frame_with_objects(
     if not nvr_client:
         raise HTTPException(status_code=500, detail="NVR client not initialized")
 
-    # Check if detector is available - if not, use mock data
-    use_mock = detector is None or not getattr(detector, "_model_loaded", False)
+    # Check if detector is available
+    if not detector:
+        raise HTTPException(status_code=500, detail="Detector not initialized")
 
     try:
         # Step 1: Extract frame from NVR
@@ -407,91 +535,39 @@ async def get_frame_with_objects(
 
         objects_with_id: list[DetectedObjectWithId] = []
 
-        if use_mock:
-            # Generate mock objects for testing
-            mock_objects = [
-                DetectedObject(
-                    label="person",
-                    bbox=BoundingBox(
-                        x=100.0, y=150.0, width=80.0, height=120.0, confidence=0.92
-                    ),
-                    confidence=0.92,
-                    frame_timestamp=request.timestamp.timestamp(),
-                ),
-                DetectedObject(
-                    label="bicycle",
-                    bbox=BoundingBox(
-                        x=250.0, y=200.0, width=100.0, height=80.0, confidence=0.85
-                    ),
-                    confidence=0.85,
-                    frame_timestamp=request.timestamp.timestamp(),
-                ),
-                DetectedObject(
-                    label="person",
-                    bbox=BoundingBox(
-                        x=400.0, y=100.0, width=70.0, height=110.0, confidence=0.78
-                    ),
-                    confidence=0.78,
-                    frame_timestamp=request.timestamp.timestamp(),
-                ),
-            ]
+        # Real detection flow
+        # Step 2: Read frame bytes
+        with open(frame_path, "rb") as f:
+            frame_bytes = f.read()
 
-            # Run through tracker to get track IDs
-            tracks = tracker.update(mock_objects, frame_idx=0)
+        # Step 3: Run detection
+        detections: list[DetectedObject] = detector.detect(frame_bytes)
 
-            # Create DetectedObjectWithId from tracks
-            for track in tracks:
-                obj_with_id = DetectedObjectWithId(
-                    object_id=track.track_id,
-                    label=track.label,
-                    confidence=track.confidence,
-                    bbox={
-                        "x": track.x - track.width / 2,
-                        "y": track.y - track.height / 2,
-                        "width": track.width,
-                        "height": track.height,
-                    },
-                    center={"x": track.x, "y": track.y},
-                )
-                objects_with_id.append(obj_with_id)
+        # Set frame timestamp
+        for det in detections:
+            det.frame_timestamp = request.timestamp.timestamp()
 
-            # Create mock annotated image
-            annotated_bytes = _create_mock_annotated_image(objects_with_id)
+        # Step 4: Run tracking
+        tracks = tracker.update(detections, frame_idx=0)
 
-        else:
-            # Real detection flow
-            # Step 2: Read frame bytes
-            with open(frame_path, "rb") as f:
-                frame_bytes = f.read()
+        # Convert tracks to DetectedObjectWithId
+        for track in tracks:
+            obj_with_id = DetectedObjectWithId(
+                object_id=track.track_id,
+                label=track.label,
+                confidence=track.confidence,
+                bbox={
+                    "x": track.x - track.width / 2,
+                    "y": track.y - track.height / 2,
+                    "width": track.width,
+                    "height": track.height,
+                },
+                center={"x": track.x, "y": track.y},
+            )
+            objects_with_id.append(obj_with_id)
 
-            # Step 3: Run detection
-            detections: list[DetectedObject] = detector.detect(frame_bytes)
-
-            # Set frame timestamp
-            for det in detections:
-                det.frame_timestamp = request.timestamp.timestamp()
-
-            # Step 4: Run tracking
-            tracks = tracker.update(detections, frame_idx=0)
-
-            # Convert tracks to DetectedObjectWithId
-            for track in tracks:
-                obj_with_id = DetectedObjectWithId(
-                    object_id=track.track_id,
-                    label=track.label,
-                    confidence=track.confidence,
-                    bbox={
-                        "x": track.x - track.width / 2,
-                        "y": track.y - track.height / 2,
-                        "width": track.width,
-                        "height": track.height,
-                    },
-                    center={"x": track.x, "y": track.y},
-                )
-                objects_with_id.append(obj_with_id)
-
-            # Step 5: Annotate image
-            annotated_bytes = annotate_frame_with_objects(frame_path, objects_with_id)
+        # Step 5: Annotate image
+        annotated_bytes = annotate_frame_with_objects(frame_path, objects_with_id)
 
         # Save annotated image to frames directory
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -532,48 +608,6 @@ def _generate_clip_filename(camera_id: str, timestamp: datetime) -> str:
     """
     timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
     return f"clip_cam{camera_id}_{timestamp_str}.mp4"
-
-
-def _generate_mock_clip(
-    output_path: Path,
-    duration_seconds: int,
-    resolution: tuple[int, int] = (640, 480),
-) -> None:
-    """Generate a mock video clip using ffmpeg testsrc.
-
-    Args:
-        output_path: Path where the clip will be saved
-        duration_seconds: Duration of the clip in seconds
-        resolution: Video resolution as (width, height)
-
-    Raises:
-        RuntimeError: If ffmpeg fails to generate the clip
-    """
-    import subprocess
-
-    width, height = resolution
-
-    cmd = [
-        "ffmpeg",
-        "-f",
-        "lavfi",
-        "-i",
-        f"testsrc=duration={duration_seconds}:size={width}x{height}:rate=25",
-        "-pix_fmt",
-        "yuv420p",
-        "-y",  # Overwrite output file if exists
-        str(output_path),
-    ]
-
-    try:
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to generate mock clip: {e.stderr}") from e
 
 
 @app.post("/video/clip", response_model=VideoClipResponse)
@@ -621,26 +655,15 @@ async def generate_video_clip(request: VideoClipRequest) -> VideoClipResponse:
     clip_path = CLIPS_DIR / clip_filename
 
     try:
-        # Determine if we should use mock clip (for testing without NVR)
-        use_mock = not nvr_client.host or nvr_client.host in ("", "localhost")
+        # Extract clip from NVR
+        logger.info(
+            f"Extracting clip from NVR: channel={request.camera_id}, "
+            f"start={request.start_timestamp}, duration={request.duration_seconds}s"
+        )
 
-        if use_mock:
-            # Generate mock clip using ffmpeg testsrc
-            logger.info(
-                f"Generating mock clip: {clip_path} "
-                f"(duration: {request.duration_seconds}s)"
-            )
-            _generate_mock_clip(clip_path, request.duration_seconds)
-        else:
-            # Extract clip from NVR
-            logger.info(
-                f"Extracting clip from NVR: channel={request.camera_id}, "
-                f"start={request.start_timestamp}, duration={request.duration_seconds}s"
-            )
+        channel = int(request.camera_id) if request.camera_id.isdigit() else 1
 
-            channel = int(request.camera_id) if request.camera_id.isdigit() else 1
-
-            nvr_client.extract_clip(
+        nvr_client.extract_clip(
                 start_time=request.start_timestamp,
                 end_time=end_timestamp,
                 channel=channel,
@@ -679,9 +702,8 @@ async def generate_video_clip(request: VideoClipRequest) -> VideoClipResponse:
 
 
 # Import search algorithm types
-from cctv_search.search.algorithm import BackwardTemporalSearch
+from cctv_search.search.algorithm import BackwardTemporalSearch, ObjectDetection
 from cctv_search.search.algorithm import BoundingBox as SearchBBox
-from cctv_search.search.algorithm import ObjectDetection
 
 
 class NVRVideoDecoder:
@@ -712,17 +734,52 @@ class NVRVideoDecoder:
         return self.get_frame_by_index(frame_idx)
 
     def get_frame_by_index(self, frame_index: int) -> bytes | None:
-        """Get frame by index from NVR."""
+        """Get frame by index from NVR with exponential backoff retry logic.
+
+        Retries up to 5 times with exponential backoff:
+        Retry delays: 1s, 2s, 4s, 8s, 16s
+        """
         timestamp = self.frame_to_timestamp(frame_index)
         dt = datetime.fromtimestamp(timestamp)
         frame_path = self._temp_dir / f"frame_{frame_index}.png"
 
-        try:
-            self.nvr_client.extract_frame(dt, self.channel, frame_path)
-            return frame_path.read_bytes()
-        except Exception as e:
-            logger.warning(f"Failed to get frame {frame_index}: {e}")
-            return None
+        max_retries = 5
+        retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff: 2^0, 2^1, 2^2, 2^3, 2^4
+
+        for attempt, delay in enumerate(retry_delays, 1):
+            try:
+                self.nvr_client.extract_frame(dt, self.channel, frame_path)
+                if attempt > 1:
+                    logger.info(
+                        f"Successfully extracted frame {frame_index} on retry {attempt}"
+                    )
+                return frame_path.read_bytes()
+            except Exception as e:
+                if attempt < max_retries:
+                    retry_dt = dt + timedelta(seconds=delay)
+                    logger.warning(
+                        f"Failed to get frame {frame_index} at {dt.isoformat()} (attempt {attempt}/{max_retries}): {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    try:
+                        self.nvr_client.extract_frame(retry_dt, self.channel, frame_path)
+                        logger.info(
+                            f"Successfully extracted frame {frame_index} at retry time {retry_dt.isoformat()} "
+                            f"(attempt {attempt})"
+                        )
+                        return frame_path.read_bytes()
+                    except Exception:
+                        # Retry failed, continue to next backoff delay
+                        dt = retry_dt  # Update dt for next retry
+                        continue
+                else:
+                    logger.error(
+                        f"Failed to get frame {frame_index} after {max_retries} attempts. "
+                        f"Last attempt at {dt.isoformat()} failed: {e}"
+                    )
+                    return None
+
+        return None
 
 
 class SearchObjectDetector:
@@ -810,23 +867,11 @@ class SearchObjectTracker:
         detection2: ObjectDetection,
     ) -> bool:
         """Check if two detections represent the same object.
-        
-        Uses IoU and spatial proximity matching.
+
+        Delegates to ByteTrack's strict matching (IoU >= 0.8 AND distance <= 50px).
         """
-        # Check label match
-        if detection1.label != detection2.label:
-            return False
-
-        # Calculate IoU
-        iou = detection1.bbox.iou_with(detection2.bbox)
-
-        # Calculate center distance
-        center1 = detection1.bbox.center
-        center2 = detection2.bbox.center
-        distance = ((center1.x - center2.x) ** 2 + (center1.y - center2.y) ** 2) ** 0.5
-
-        # Match criteria: IoU >= 0.5 OR distance <= 100 pixels
-        return iou >= 0.5 or distance <= 100.0
+        # Delegate to ByteTrack's stricter matching logic
+        return self.tracker.is_same_object(detection1, detection2)
 
     def reset(self) -> None:
         """Reset tracker state."""
@@ -873,325 +918,176 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
     )
 
     try:
-        # Determine if we should use mock results (for testing without real NVR)
-        use_mock = MOCK_SEARCH_MODE or not nvr_client.host
+        # Real implementation using NVR and search algorithm
+        logger.info("Running real object search with NVR")
 
-        if use_mock:
-            # Generate realistic mock search results
-            logger.info("Using mock search mode")
+        # Check if detector and tracker are available
+        if not detector:
+            raise HTTPException(
+                status_code=500, detail="Detector not initialized"
+            )
+        if not tracker:
+            raise HTTPException(
+                status_code=500, detail="Tracker not initialized"
+            )
 
-            # Simulate search iterations (coarse + medium + fine phases)
-            mock_iterations = random.randint(15, 45)
+        try:
+            # Create video decoder adapter
+            video_decoder = NVRVideoDecoder(
+                nvr_client=nvr_client,
+                channel=int(request.camera_id)
+                if request.camera_id.isdigit()
+                else 1,
+                fps=20.0,
+            )
 
-            # Simulate finding object 60-90% of the time
-            if random.random() < 0.75:
-                # Object found - appeared somewhere in the search window
-                appear_offset_seconds = random.randint(
-                    30, int(request.search_duration_seconds * 0.8)
+            # Create search detector wrapper
+            search_detector = SearchObjectDetector(
+                detector=detector, fps=20.0
+            )
+
+            # Create search tracker wrapper using ByteTrack's strict matching
+            search_tracker = SearchObjectTracker(
+                tracker=tracker,
+                target_bbox=request.object_bbox,
+                target_label=request.object_label,
+            )
+
+            # Create backward search
+            search = BackwardTemporalSearch(
+                video_decoder=video_decoder,
+                detector=search_detector,
+                tracker=search_tracker,
+                fps=20.0,
+            )
+
+            # Log search configuration
+            logger.info("\n" + "=" * 70)
+            logger.info("OBJECT SEARCH STARTED")
+            logger.info("=" * 70)
+            logger.info(f"Camera ID: {request.camera_id}")
+            logger.info(f"Start timestamp: {request.start_timestamp}")
+            logger.info(f"Object: {request.object_label} (ID: {request.object_id})")
+            logger.info(f"Search duration: {request.search_duration_seconds}s")
+            logger.info(f"Bounding box: x={request.object_bbox['x']:.1f}, y={request.object_bbox['y']:.1f}, "
+                        f"w={request.object_bbox['width']:.1f}, h={request.object_bbox['height']:.1f}")
+            logger.info(f"Confidence: {request.object_confidence:.3f}")
+            logger.info("=" * 70)
+
+            # Create target detection from request using search algorithm
+            target_detection = ObjectDetection(
+                label=request.object_label,
+                bbox=SearchBBox(
+                    x=request.object_bbox["x"],
+                    y=request.object_bbox["y"],
+                    width=request.object_bbox["width"],
+                    height=request.object_bbox["height"],
+                    confidence=request.object_confidence,
+                ),
+                confidence=request.object_confidence,
+            )
+
+            # Run search
+            logger.info("\nStarting backward temporal search...")
+            search_result = search.search(
+                start_time=request.start_timestamp,
+                target_detection=target_detection,
+            )
+
+            # Check for error status first
+            from cctv_search.search.algorithm import SearchStatus
+
+            if search_result.status == SearchStatus.ERROR:
+                logger.error("\n" + "=" * 70)
+                logger.error("SEARCH RESULT: ERROR")
+                logger.error("=" * 70)
+                logger.error(f"Error: {search_result.message}")
+                logger.error("=" * 70)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Search failed: {search_result.message}"
                 )
-                first_seen = request.start_timestamp - timedelta(
-                    seconds=appear_offset_seconds
+
+            if search_result.found:
+                first_seen = datetime.fromtimestamp(
+                    search_result.timestamp or 0
                 )
-                track_duration = (request.start_timestamp - first_seen).total_seconds()
+                track_duration = (
+                    request.start_timestamp - first_seen
+                ).total_seconds()
 
-                # Generate 15-second video clip from first appearance
-                clip_duration = 15
-                clip_filename = _generate_clip_filename(
-                    request.camera_id, first_seen
-                )
-                clip_path = CLIPS_DIR / clip_filename
-
-                try:
-                    CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-
-                    if use_mock or not nvr_client.host:
-                        # Generate mock clip using ffmpeg testsrc
-                        logger.info(
-                            f"Generating mock clip for search result: {clip_path}"
-                        )
-                        _generate_mock_clip(clip_path, clip_duration)
-                    else:
-                        # Extract clip from NVR
-                        logger.info(
-                            f"Extracting clip from NVR: channel={request.camera_id}, "
-                            f"start={first_seen}, duration={clip_duration}s"
-                        )
-                        channel = (
-                            int(request.camera_id)
-                            if request.camera_id.isdigit()
-                            else 1
-                        )
-                        end_time = first_seen + timedelta(seconds=clip_duration)
-                        nvr_client.extract_clip(
-                            start_time=first_seen,
-                            end_time=end_time,
-                            channel=channel,
-                            output_path=clip_path,
-                        )
-
-                    clip_path_str = str(clip_path)
-                    logger.info(f"Clip saved to: {clip_path_str}")
-
-                except Exception as e:
-                    logger.warning(f"Failed to generate clip: {e}")
-                    clip_path_str = None
-
-                # Generate annotated image at first_seen timestamp
+                # Skip clip and image generation - only search results returned
+                clip_path_str = None
                 image_path_str = None
-                try:
-                    channel = int(request.camera_id) if request.camera_id.isdigit() else 1
-                    frame_path = nvr_client.extract_frame(
-                        timestamp=first_seen,
-                        channel=channel,
-                        output_path=f"/tmp/search_frame_{first_seen.isoformat()}.png",
-                    )
-                    
-                    # Create mock detected object for annotation
-                    mock_obj = DetectedObjectWithId(
-                        object_id=request.object_id,
-                        label=request.object_label,
-                        confidence=request.object_confidence,
-                        bbox=request.object_bbox,
-                        center={
-                            "x": request.object_bbox["x"] + request.object_bbox["width"] / 2,
-                            "y": request.object_bbox["y"] + request.object_bbox["height"] / 2,
-                        },
-                    )
-                    
-                    # Annotate and save image
-                    FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-                    ts_str = first_seen.strftime("%Y%m%d_%H%M%S")
-                    image_filename = f"search_frame_{ts_str}_ch{channel}_obj{request.object_id}.png"
-                    image_path = FRAMES_DIR / image_filename
-                    
-                    annotated_bytes = annotate_frame_with_objects(frame_path, [mock_obj])
-                    image_path.write_bytes(annotated_bytes)
-                    image_path_str = str(image_path)
-                    logger.info(f"Search annotated image saved to: {image_path_str}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate annotated image: {e}")
-                    image_path_str = None
+
+                # Build RTSP playback URL for 15 seconds before first appearance
+                playback_start = first_seen - timedelta(seconds=15)
+                playback_end = first_seen  # End at the found timestamp
+                channel = int(request.camera_id) if request.camera_id.isdigit() else 1
+                rtsp_url = nvr_client._build_rtsp_url_with_auth(
+                    channel=channel,
+                    start_time=playback_start,
+                    end_time=playback_end,
+                )
+                # Return full ffplay command (no quotes needed, URL is already encoded)
+                rtsp_url = f"ffplay -rtsp_transport tcp {rtsp_url}"
 
                 result = ObjectSearchResult(
                     found=True,
                     first_seen_timestamp=first_seen,
                     last_seen_timestamp=request.start_timestamp,
-                    search_iterations=mock_iterations,
-                    confidence=request.object_confidence * random.uniform(0.85, 0.98),
-                    message=f"Object found after {mock_iterations} search iterations. "
-                    f"Track duration: {track_duration:.1f}s",
+                    search_iterations=search_result.iterations,
+                    confidence=search_result.confidence,
+                    message=f"Object found after {search_result.iterations} "
+                    f"search iterations. Track duration: {track_duration:.1f}s",
                     track_duration_seconds=track_duration,
                     clip_path=clip_path_str,
                     image_path=image_path_str,
+                    play_command=rtsp_url,
                 )
+
+                logger.info("\n" + "=" * 70)
+                logger.info("SEARCH RESULT: SUCCESS")
+                logger.info("=" * 70)
+                logger.info(f"First seen: {first_seen}")
+                logger.info(f"Track duration: {track_duration:.1f} seconds")
+                logger.info(f"Search iterations: {search_result.iterations}")
+                logger.info(f"Confidence: {search_result.confidence}")
+                logger.info("=" * 70)
 
                 return ObjectSearchResponse(status="success", result=result)
             else:
-                # Object not found in search window
                 result = ObjectSearchResult(
                     found=False,
                     first_seen_timestamp=None,
                     last_seen_timestamp=None,
-                    search_iterations=mock_iterations,
+                    search_iterations=search_result.iterations,
                     confidence=None,
                     message="Object not found in specified search window. "
                     "It may have appeared earlier than the search range.",
                     track_duration_seconds=None,
                     clip_path=None,
                     image_path=None,
+                    play_command=None,
                 )
 
-                return ObjectSearchResponse(status="not_found", result=result)
+                logger.info("\n" + "=" * 70)
+                logger.info("SEARCH RESULT: NOT FOUND")
+                logger.info("=" * 70)
+                logger.info(f"Search iterations: {search_result.iterations}")
+                logger.info("Reason: Object not found in specified search window")
+                logger.info("Suggestion: The object may have appeared earlier than the search range")
+                logger.info("=" * 70)
 
-        else:
-            # Real implementation using NVR and search algorithm
-            logger.info("Running real object search with NVR")
-
-            # Check if detector and tracker are available
-            if not detector:
-                raise HTTPException(
-                    status_code=500, detail="Detector not initialized"
-                )
-            if not tracker:
-                raise HTTPException(
-                    status_code=500, detail="Tracker not initialized"
+                return ObjectSearchResponse(
+                    status="not_found", result=result
                 )
 
-            try:
-                # Create video decoder adapter
-                video_decoder = NVRVideoDecoder(
-                    nvr_client=nvr_client,
-                    channel=int(request.camera_id)
-                    if request.camera_id.isdigit()
-                    else 1,
-                    fps=20.0,
-                )
-
-                # Create search detector wrapper
-                search_detector = SearchObjectDetector(
-                    detector=detector, fps=20.0
-                )
-
-                # Create search tracker wrapper
-                search_tracker = SearchObjectTracker(
-                    tracker=tracker,
-                    target_bbox=request.object_bbox,
-                    target_label=request.object_label,
-                )
-
-                # Create backward search
-                search = BackwardTemporalSearch(
-                    video_decoder=video_decoder,
-                    detector=search_detector,
-                    tracker=search_tracker,
-                    fps=20.0,
-                )
-
-                # Create target detection from request using search algorithm
-                target_detection = ObjectDetection(
-                    label=request.object_label,
-                    bbox=SearchBBox(
-                        x=request.object_bbox["x"],
-                        y=request.object_bbox["y"],
-                        width=request.object_bbox["width"],
-                        height=request.object_bbox["height"],
-                        confidence=request.object_confidence,
-                    ),
-                    confidence=request.object_confidence,
-                )
-
-                # Run search
-                search_result = search.search(
-                    start_time=request.start_timestamp,
-                    target_detection=target_detection,
-                )
-
-                if search_result.found:
-                    first_seen = datetime.fromtimestamp(
-                        search_result.timestamp or 0
-                    )
-                    track_duration = (
-                        request.start_timestamp - first_seen
-                    ).total_seconds()
-
-                    # Generate 15-second clip from first appearance
-                    clip_duration = 15
-                    clip_filename = _generate_clip_filename(
-                        request.camera_id, first_seen
-                    )
-                    clip_path = CLIPS_DIR / clip_filename
-
-                    try:
-                        CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-                        logger.info(
-                            f"Extracting clip from NVR: channel={request.camera_id}, "
-                            f"start={first_seen}, duration={clip_duration}s"
-                        )
-                        channel = (
-                            int(request.camera_id)
-                            if request.camera_id.isdigit()
-                            else 1
-                        )
-                        end_time = first_seen + timedelta(
-                            seconds=clip_duration
-                        )
-                        nvr_client.extract_clip(
-                            start_time=first_seen,
-                            end_time=end_time,
-                            channel=channel,
-                            output_path=clip_path,
-                        )
-                        clip_path_str = str(clip_path)
-                        logger.info(f"Clip saved to: {clip_path_str}")
-                    except Exception as e:
-                        logger.warning(f"Failed to generate clip: {e}")
-                        clip_path_str = None
-
-                    # Generate annotated image at first_seen timestamp
-                    image_path_str = None
-                    try:
-                        channel = int(request.camera_id) if request.camera_id.isdigit() else 1
-                        frame_path = nvr_client.extract_frame(
-                            timestamp=first_seen,
-                            channel=channel,
-                            output_path=f"/tmp/search_frame_{first_seen.isoformat()}.png",
-                        )
-                        
-                        # Run detection on the frame
-                        with open(frame_path, "rb") as f:
-                            frame_bytes = f.read()
-                        
-                        detections = detector.detect(frame_bytes)
-                        
-                        # Convert detections to DetectedObjectWithId format
-                        objects_with_id = []
-                        for i, det in enumerate(detections):
-                            obj = DetectedObjectWithId(
-                                object_id=i,
-                                label=det.label,
-                                confidence=det.confidence,
-                                bbox={
-                                    "x": det.bbox.x,
-                                    "y": det.bbox.y,
-                                    "width": det.bbox.width,
-                                    "height": det.bbox.height,
-                                },
-                                center={
-                                    "x": det.bbox.x + det.bbox.width / 2,
-                                    "y": det.bbox.y + det.bbox.height / 2,
-                                },
-                            )
-                            objects_with_id.append(obj)
-                        
-                        # Annotate and save image
-                        FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-                        ts_str = first_seen.strftime("%Y%m%d_%H%M%S")
-                        image_filename = f"search_frame_{ts_str}_ch{channel}_obj{request.object_id}.png"
-                        image_path = FRAMES_DIR / image_filename
-                        
-                        annotated_bytes = annotate_frame_with_objects(frame_path, objects_with_id)
-                        image_path.write_bytes(annotated_bytes)
-                        image_path_str = str(image_path)
-                        logger.info(f"Search annotated image saved to: {image_path_str}")
-                    except Exception as e:
-                        logger.warning(f"Failed to generate annotated image: {e}")
-                        image_path_str = None
-
-                    result = ObjectSearchResult(
-                        found=True,
-                        first_seen_timestamp=first_seen,
-                        last_seen_timestamp=request.start_timestamp,
-                        search_iterations=search_result.iterations,
-                        confidence=search_result.confidence,
-                        message=f"Object found after {search_result.iterations} "
-                        f"search iterations. Track duration: {track_duration:.1f}s",
-                        track_duration_seconds=track_duration,
-                        clip_path=clip_path_str,
-                        image_path=image_path_str,
-                    )
-                    return ObjectSearchResponse(status="success", result=result)
-                else:
-                    result = ObjectSearchResult(
-                        found=False,
-                        first_seen_timestamp=None,
-                        last_seen_timestamp=None,
-                        search_iterations=search_result.iterations,
-                        confidence=None,
-                        message="Object not found in specified search window. "
-                        "It may have appeared earlier than the search range.",
-                        track_duration_seconds=None,
-                        clip_path=None,
-                        image_path=None,
-                    )
-                    return ObjectSearchResponse(
-                        status="not_found", result=result
-                    )
-
-            except Exception as e:
-                logger.exception("Real object search failed")
-                raise HTTPException(
-                    status_code=500, detail=f"Search failed: {e}"
-                ) from e
+        except Exception as e:
+            logger.exception("Real object search failed")
+            raise HTTPException(
+                status_code=500, detail=f"Search failed: {e}"
+            ) from e
 
     except HTTPException:
         raise
