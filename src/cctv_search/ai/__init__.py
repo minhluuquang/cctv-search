@@ -6,7 +6,7 @@ a transformer-based detection model optimized for CCTV footage.
 Features:
 - Deep feature extraction for robust object matching
 - Occlusion handling via feature similarity
-- Feature-based tracking (replaces ByteTrack/BoT-SORT)
+- Feature-based tracking using deep embeddings
 
 Usage:
     from cctv_search.ai import RFDetrDetector, FeatureTracker

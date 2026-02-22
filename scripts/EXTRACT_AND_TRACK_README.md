@@ -1,12 +1,12 @@
 # Video Extraction and Tracking Script
 
-Script for extracting video clips from NVR, running RF-DETR detection and ByteTrack multi-object tracking, and outputting annotated videos.
+Script for extracting video clips from NVR, running RF-DETR detection and feature-based multi-object tracking, and outputting annotated videos.
 
 ## Features
 
 - 📹 **Extract video clips** from Dahua NVR via RTSP
 - 🤖 **RF-DETR object detection** on every frame
-- 🎯 **ByteTrack multi-object tracking** with persistent IDs
+- 🎯 **Feature-based multi-object tracking** with persistent IDs
 - 🎬 **Output annotated video** with bounding boxes and track IDs
 - 📊 **Track statistics** (duration, frame count, etc.)
 
@@ -134,7 +134,7 @@ Initializing detector (confidence: 0.5)...
 Loading model (may download on first run)...
 ✓ Model loaded successfully
 
-Initializing ByteTrack tracker...
+Initializing feature tracker...
 ✓ Tracker initialized
 
 Video: 1920x1080 @ 20.0fps, 600 frames
@@ -204,7 +204,7 @@ Track IDs cycle through colors:
 1. **Video Extraction** - Uses ffmpeg to download RTSP stream from NVR
 2. **Frame-by-Frame Processing** - Reads video and processes each frame
 3. **Object Detection** - RF-DETR detects objects in each frame
-4. **Multi-Object Tracking** - ByteTrack maintains object identities across frames
+4. **Multi-Object Tracking** - FeatureTracker maintains object identities across frames using deep embeddings
 5. **Annotation** - Draws bounding boxes with track IDs on each frame
 6. **Video Encoding** - Writes annotated frames to output video file
 
@@ -298,7 +298,7 @@ This script demonstrates the full tracking pipeline used by the backward search 
 
 1. **Frame Extraction** - Same NVR client used by search
 2. **Detection** - Same RF-DETR detector
-3. **Tracking** - Same ByteTrack tracker
+3. **Tracking** - Same FeatureTracker
 4. **Visualization** - Helps debug and validate tracking results
 
 The search algorithm (`backward_search`) uses the same components to find when objects appeared in the past.

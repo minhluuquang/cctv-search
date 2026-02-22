@@ -2,7 +2,7 @@
 """NVR Video Extraction, Detection and Tracking Script.
 
 This script extracts a video clip from the Dahua NVR for a time range,
-runs RF-DETR object detection and ByteTrack multi-object tracking on each frame,
+runs RF-DETR object detection and feature-based multi-object tracking on each frame,
 and outputs an annotated video with bounding boxes and track IDs.
 
 Usage:
@@ -136,7 +136,7 @@ def process_video_with_tracking(
     target_class: str | None = None,
     fps: int = 20,
 ) -> dict:
-    """Process video with detection and ByteTrack tracking.
+    """Process video with detection and feature-based tracking.
     
     Args:
         video_path: Path to input video

@@ -857,7 +857,7 @@ class SearchObjectDetector:
 class SearchObjectTracker:
     """Tracker wrapper for search algorithm.
 
-    Wraps ByteTrackTracker to match the ObjectTracker protocol expected
+    Wraps FeatureTracker to match the ObjectTracker protocol expected
     by the search algorithm, specifically for is_same_object matching.
     """
 
@@ -884,9 +884,9 @@ class SearchObjectTracker:
     ) -> bool:
         """Check if two detections represent the same object.
 
-        Delegates to ByteTrack's strict matching (IoU >= 0.8 AND distance <= 50px).
+        Delegates to FeatureTracker's matching (combines feature similarity + IoU + distance).
         """
-        # Delegate to ByteTrack's stricter matching logic
+        # Delegate to FeatureTracker's matching logic
         return self.tracker.is_same_object(detection1, detection2)
 
     def reset(self) -> None:
@@ -963,7 +963,7 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
                 detector=detector, fps=20.0
             )
 
-            # Create search tracker wrapper using ByteTrack's strict matching
+            # Create search tracker wrapper using FeatureTracker's matching
             search_tracker = SearchObjectTracker(
                 tracker=tracker,
                 target_bbox=request.object_bbox,

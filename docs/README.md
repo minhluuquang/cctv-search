@@ -47,7 +47,7 @@ New to the project? Start here:
 CCTV Search is an AI-powered video analysis system for searching CCTV footage from Network Video Recorders (NVR). Key features:
 
 - **Object Detection**: Real-time detection using RF-DETR transformer models
-- **Multi-Object Tracking**: ByteTrack algorithm for consistent object IDs
+- **Multi-Object Tracking**: Feature-based tracking with deep embeddings for consistent object IDs
 - **Efficient Search**: Backward coarse-to-fine algorithm (99% reduction in model calls)
 - **NVR Integration**: Direct RTSP connection to Dahua/Hikvision NVRs
 
@@ -62,7 +62,7 @@ CCTV Search is an AI-powered video analysis system for searching CCTV footage fr
                                                 ▼
                                         ┌─────────────┐
                                         │  Tracker    │
-                                        │ (ByteTrack) │
+                                        │(FeatureTrack)│
                                         └──────┬──────┘
                                                │
                                                ▼
@@ -76,7 +76,7 @@ CCTV Search is an AI-powered video analysis system for searching CCTV footage fr
 
 - **FastAPI**: Modern web framework for the REST API
 - **RF-DETR**: Transformer-based object detection
-- **ByteTrack**: Multi-object tracking algorithm
+- **FeatureTracker**: Custom feature-based object tracker
 - **FFmpeg**: Video frame extraction
 - **OpenCV**: Image processing
 - **Python 3.12+**: Programming language

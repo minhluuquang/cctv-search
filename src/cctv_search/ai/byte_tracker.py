@@ -1,7 +1,6 @@
 """Feature-based object tracker using RF-DETR deep embeddings.
 
-This module provides tracking without traditional multi-object trackers like
-ByteTrack or BoT-SORT. Instead, it uses deep feature embeddings from RF-DETR
+This module provides tracking using deep feature embeddings from RF-DETR
 to match objects across frames.
 
 This approach is:

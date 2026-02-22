@@ -223,7 +223,7 @@ class ObjectDetector(Protocol):
 
 
 class ObjectTracker(Protocol):
-    """Protocol for multi-object tracking (e.g., ByteTrack)."""
+    """Protocol for multi-object tracking (e.g., FeatureTracker)."""
 
     def update(self, detections: list[ObjectDetection]) -> list[ObjectTrack]:
         """Update tracks with new detections.

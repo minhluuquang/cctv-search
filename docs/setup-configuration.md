@@ -9,6 +9,7 @@
 - **Memory**: 8GB RAM minimum (16GB recommended)
 - **Storage**: 2GB free space for models and dependencies
 - **GPU**: Optional but recommended (CUDA-capable for GPU acceleration)
+- **Network**: Access to NVR via RTSP (port 554)
 
 ### Required Software
 
@@ -31,6 +32,8 @@
    ```
 
 3. **Git** - Version control
+
+4. **RTSP-capable NVR** - Dahua or Hikvision NVR with network access
 
 ## Installation
 
@@ -91,7 +94,7 @@ NVR_PASSWORD=your_password    # NVR password
 NVR_CHANNEL=1                 # Default camera channel
 
 # Optional: RTSP transport protocol
-RTSP_TRANSPORT=tcp            # tcp or udp
+RTSP_TRANSPORT=tcp            # tcp or udp (recommended: tcp)
 ```
 
 ### Configuration Options
@@ -121,14 +124,33 @@ from cctv_search.ai import RFDetrDetector
 # Adjust confidence threshold
 detector = RFDetrDetector(confidence_threshold=0.6)
 
-# Adjust tracker parameters
-from cctv_search.ai import ByteTrackTracker
+# Load model with specific resolution
+detector.load_model(model_id="rfdetr_base", resolution=560)
+# Options: 560 (faster), 864 (more accurate)
 
-tracker = ByteTrackTracker(
-    track_thresh=0.5,      # Detection confidence threshold
-    match_thresh=0.8,      # IoU threshold for matching
-    track_buffer=30,       # Frames to keep lost tracks
-    frame_rate=20          # Video FPS
+# Adjust tracker parameters
+from cctv_search.ai import FeatureTracker
+
+tracker = FeatureTracker(
+    track_thresh=0.5,        # Detection confidence threshold
+    match_thresh=0.8,        # IoU threshold for matching
+    track_buffer=30,         # Frames to keep lost tracks
+    frame_rate=20,           # Video FPS
+    feature_weight=0.3,      # Feature matching weight
+    feature_threshold=0.75   # Feature similarity threshold
+)
+```
+
+#### Search Algorithm Settings
+
+```python
+from cctv_search.search import BackwardTemporalSearch
+
+search = BackwardTemporalSearch(
+    video_decoder=decoder,
+    detector=detector,
+    tracker=tracker,
+    fps=20.0
 )
 ```
 
@@ -182,13 +204,51 @@ uv run pytest --cov=src/cctv_search --cov-report=term-missing
 
 ```bash
 # Test NVR connection
-uv run python test_connection.py
+uv run python scripts/test_connection.py
 
 # Test frame extraction
-uv run python test_extract_frame.py
+uv run python scripts/test_extract_frame.py
 
 # Test NVR diagnostics
-uv run python test_nvr_diagnose.py
+uv run python scripts/test_nvr_diagnose.py
+
+# Test RF-DETR detector
+uv run python scripts/test_detector.py
+
+# Test RF-DETR model loading
+uv run python scripts/test_rfdetr.py
+
+# Test object matching
+uv run python scripts/test_matching.py
+```
+
+## Utility Scripts
+
+The `scripts/` directory contains utility scripts for development and testing:
+
+### Frame and Video Extraction
+- **`extract_and_track.py`** - Extract frames and track objects across video
+- **`extract_and_detect.py`** - Extract frames and detect objects
+
+### Testing and Diagnostics
+- **`test_connection.py`** - Test basic NVR connection
+- **`test_extract_frame.py`** - Test single frame extraction
+- **`test_nvr_diagnose.py`** - Comprehensive NVR diagnostics
+- **`test_detector.py`** - Test RF-DETR detection on images
+- **`test_rfdetr.py`** - Test RF-DETR model loading
+- **`test_matching.py`** - Test object matching algorithms
+
+### Usage Examples
+
+```bash
+# Test NVR connection
+uv run python scripts/test_connection.py
+
+# Extract and track objects in a video segment
+uv run python scripts/extract_and_track.py
+
+# Test detection on a test image
+uv run python scripts/test_detector.py
 ```
 
 ## Troubleshooting
@@ -218,6 +278,11 @@ RuntimeError: RF-DETR not installed
 uv sync --dev
 ```
 
+Or install manually:
+```bash
+uv pip install rfdetr
+```
+
 #### RTSP Connection Timeout
 
 ```
@@ -226,21 +291,71 @@ RuntimeError: Failed to extract frame: Connection timed out
 
 **Solutions**:
 1. Check NVR IP address and port
-2. Verify RTSP is enabled on NVR
-3. Try switching transport protocol (TCP/UDP)
-4. Check firewall rules
+2. Verify RTSP is enabled on NVR (usually in Network settings)
+3. Try switching transport protocol (TCP/UDP):
+   ```bash
+   export RTSP_TRANSPORT=udp
+   ```
+4. Check firewall rules (port 554 must be open)
+5. Verify NVR credentials are correct
+6. Check NVR network connection: `ping <NVR_HOST>`
+
+#### GPU Not Available
+
+```
+RuntimeError: CUDA out of memory
+# or
+WARNING: Running on CPU (GPU not available)
+```
+
+**Solutions**:
+1. Check CUDA installation:
+   ```bash
+   uv run python -c "import torch; print(torch.cuda.is_available())"
+   ```
+2. Reduce batch size or model resolution:
+   ```python
+   detector.load_model(resolution=560)  # Instead of 864
+   ```
+3. Use CPU inference (slower but no GPU needed):
+   ```bash
+   export CUDA_VISIBLE_DEVICES=""
+   ```
+4. Close other GPU applications
+5. Add more GPU memory or use a GPU with more VRAM
 
 #### Out of Memory
 
 ```
 RuntimeError: CUDA out of memory
+# or
+Killed (process terminated)
 ```
 
 **Solutions**:
-1. Reduce batch size
-2. Use CPU inference (slower)
+1. Reduce model resolution (560 instead of 864)
+2. Process shorter video clips
 3. Close other applications
-4. Add more RAM or GPU memory
+4. Add more RAM (16GB recommended)
+5. Use swap space for temporary files
+
+#### Search Not Finding Objects
+
+```
+Object not found in specified search window
+```
+
+**Solutions**:
+1. Increase search duration:
+   ```json
+   {
+     "search_duration_seconds": 7200  // 2 hours instead of 1
+   }
+   ```
+2. Lower confidence threshold in tracker
+3. Check that reference object bbox is accurate
+4. Verify NVR has footage for that time period
+5. Check for time zone differences between system and NVR
 
 ### Debug Mode
 
@@ -257,6 +372,13 @@ export LOG_LEVEL=DEBUG
 uv run cctv-search
 ```
 
+### Log Files
+
+Logs are output to stdout/stderr. To save to file:
+```bash
+uv run cctv-search 2>&1 | tee cctv_search.log
+```
+
 ## Advanced Configuration
 
 ### Custom Model Path
@@ -268,6 +390,13 @@ from cctv_search.ai import RFDetrDetector
 
 detector = RFDetrDetector()
 detector.load_model()  # Downloads to ~/.cache/rfdetr/
+```
+
+To use a specific cached model:
+```python
+import os
+os.environ["RFDETR_CACHE_DIR"] = "/path/to/models"
+detector.load_model()
 ```
 
 ### Proxy Configuration
@@ -287,12 +416,31 @@ Ensure CUDA is properly installed:
 ```bash
 # Check CUDA availability
 uv run python -c "import torch; print(torch.cuda.is_available())"
+uv run python -c "import torch; print(torch.cuda.get_device_name(0))"
 
 # If False, install CUDA-enabled PyTorch
 uv pip install torch --upgrade --index-url https://download.pytorch.org/whl/cu118
 ```
 
-## Directory Structure
+### Multiple Cameras
+
+Configure multiple cameras by passing channel parameter in API calls:
+
+```python
+# Channel 1
+requests.post("/frames/objects", json={
+    "timestamp": "2024-01-15T14:30:00",
+    "channel": 1
+})
+
+# Channel 2
+requests.post("/frames/objects", json={
+    "timestamp": "2024-01-15T14:30:00",
+    "channel": 2
+})
+```
+
+### Directory Structure
 
 ```
 cctv-search/
@@ -306,11 +454,37 @@ cctv-search/
 │       ├── nvr/            # NVR client modules
 │       ├── ai/             # AI/ML modules
 │       ├── search/         # Search algorithms
+│       ├── detector.py     # Detector integration
 │       └── tracker.py      # Object tracker integration
 ├── tests/                  # Test suite
-├── docs/                   # Documentation
-└── scripts/                # Utility scripts
+├── scripts/                # Utility scripts
+├── clips/                  # Generated video clips
+├── frames/                 # Extracted/annotated frames
+└── docs/                   # Documentation
 ```
+
+## Performance Tuning
+
+### Optimize for Speed
+
+1. Use GPU (10x faster than CPU)
+2. Use lower model resolution (560 vs 864)
+3. Reduce track_buffer for faster processing
+4. Use TCP transport (more reliable, less retry overhead)
+
+### Optimize for Accuracy
+
+1. Use higher model resolution (864 vs 560)
+2. Increase confidence threshold (0.7 vs 0.5)
+3. Enable feature matching (feature_weight=0.3)
+4. Lower IoU threshold for better recall (0.7 vs 0.8)
+
+### Optimize for Memory
+
+1. Use CPU instead of GPU
+2. Reduce batch size
+3. Process shorter clips
+4. Clear frames/clips directory regularly
 
 ## Next Steps
 
@@ -318,3 +492,10 @@ cctv-search/
 2. Review [Technical Architecture](technical-architecture.md) for system design
 3. Check [API Reference](api-reference.md) for programming interface
 4. See `AGENTS.md` for development guidelines
+
+## Getting Help
+
+- Check logs for error messages
+- Review troubleshooting section above
+- Verify NVR configuration with `scripts/test_nvr_diagnose.py`
+- Test basic connectivity with `scripts/test_connection.py`
