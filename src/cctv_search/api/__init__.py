@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     # Startup
     global nvr_client, detector, tracker
     nvr_client = DahuaNVRClient()
-    detector = RFDetrDetector(confidence_threshold=0.1, nms_threshold=0.90)
+    detector = RFDetrDetector()
     tracker = FeatureTracker()
     # Load RF-DETR model on startup (optional - may fail if not installed)
     try:

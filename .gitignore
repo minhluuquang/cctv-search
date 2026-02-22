@@ -17,8 +17,7 @@ frame_*.png
 test_*.png
 
 # models
-rf-detr-base.pth
-rf-detr-large-2026.pth
+rf-detr-*.pth
 
 # Generated video clips
 clips/

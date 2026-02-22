@@ -68,13 +68,13 @@ class DetectedObject:
 
 class RFDetrDetector:
     """RF-DETR object detector with deep feature extraction for CCTV footage.
-    
+
     RF-DETR is a transformer-based detection model that provides:
     - Real-time object detection
     - Deep feature embeddings for robust matching
     - High accuracy on small objects
     - Occlusion handling via feature similarity
-    
+
     Example:
         >>> detector = RFDetrDetector()
         >>> detector.load_model()
@@ -107,19 +107,20 @@ class RFDetrDetector:
         self.nms_threshold = nms_threshold
         self._model = None
         self._model_loaded = False
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
 
     def load_model(self) -> None:
         """Load RF-DETR model.
-        
+
         Downloads and initializes the pre-trained RF-DETR model.
         Model is cached after first download.
         """
         try:
-            from rfdetr import RFDETRLarge
+            from rfdetr import RFDETRMedium
 
-            logger.info("Loading RF-DETR Large model...")
-            self._model = RFDETRLarge()
+            logger.info("Loading RF-DETR Medium model...")
+            self._model = RFDETRMedium(resolution=1024)
 
             # Optimize model for inference to reduce latency
             logger.info("Optimizing RF-DETR model for inference...")
@@ -132,36 +133,37 @@ class RFDetrDetector:
         except ImportError as e:
             logger.error(f"Failed to import rfdetr: {e}")
             logger.error("Please install RF-DETR: pip install rfdetr")
-            raise RuntimeError("RF-DETR not installed. Run: pip install rfdetr") from e
+            raise RuntimeError(
+                "RF-DETR not installed. Run: pip install rfdetr") from e
         except Exception as e:
             logger.error(f"Failed to load RF-DETR model: {e}")
             raise RuntimeError(f"Failed to load model: {e}") from e
 
     def detect(self, frame: bytes | NDArray[np.uint8]) -> list[DetectedObject]:
         """Detect objects in a frame (without features).
-        
+
         Args:
             frame: Video frame as bytes or numpy array
-            
+
         Returns:
             List of detected objects with bounding boxes and confidence scores
         """
         return self.detect_with_features(frame, extract_features=False)
 
     def detect_with_features(
-        self, 
+        self,
         frame: bytes | NDArray[np.uint8],
         extract_features: bool = True
     ) -> list[DetectedObject]:
         """Detect objects in a frame with optional deep feature extraction.
-        
+
         Extracts features from the transformer's encoder output using
         RoI pooling for each detected bounding box.
-        
+
         Args:
             frame: Video frame as bytes or numpy array
             extract_features: Whether to extract deep features (slower but more accurate)
-            
+
         Returns:
             List of detected objects with bounding boxes, confidence, and features
         """
@@ -172,16 +174,16 @@ class RFDetrDetector:
             # Convert bytes to numpy array if needed
             if isinstance(frame, bytes):
                 frame = self._bytes_to_numpy(frame)
-            
+
             # Store original frame for feature extraction
             original_frame = frame.copy()
 
             # Run inference with NMS threshold
-            results = self._model.predict(frame, iou_threshold=self.nms_threshold)
+            results = self._model.predict(frame)
 
             # Get class names from model if available
             class_names = getattr(self._model, 'class_names', None)
-            
+
             detections = []
 
             for i in range(len(results.xyxy)):
@@ -204,7 +206,8 @@ class RFDetrDetector:
                 )
 
                 # Get class label
-                class_id = int(results.class_id[i]) if results.class_id is not None else 0
+                class_id = int(
+                    results.class_id[i]) if results.class_id is not None else 0
                 if class_names and class_id < len(class_names):
                     label = class_names[class_id]
                 else:
@@ -236,45 +239,46 @@ class RFDetrDetector:
             return []
 
     def _extract_features_for_bbox(
-        self, 
-        frame: NDArray[np.uint8], 
+        self,
+        frame: NDArray[np.uint8],
         x1: int, y1: int, x2: int, y2: int
     ) -> np.ndarray | None:
         """Extract deep features for a specific bounding box region.
-        
+
         Uses a simple but effective approach: crop the region and run
         through the backbone to get features.
-        
+
         Args:
             frame: Full frame image
             x1, y1, x2, y2: Bounding box coordinates
-            
+
         Returns:
             Feature vector as numpy array or None if extraction fails
         """
         try:
             import cv2
-            
+
             # Ensure valid coordinates
             h, w = frame.shape[:2]
             x1 = max(0, min(x1, w))
             y1 = max(0, min(y1, h))
             x2 = max(0, min(x2, w))
             y2 = max(0, min(y2, h))
-            
+
             if x2 <= x1 or y2 <= y1:
                 return None
-            
+
             # Crop the region
             crop = frame[y1:y2, x1:x2]
-            
+
             # Resize to standard size for consistent features
             crop_resized = cv2.resize(crop, (224, 224))
-            
+
             # Convert to tensor
-            crop_tensor = torch.from_numpy(crop_resized).permute(2, 0, 1).float() / 255.0
+            crop_tensor = torch.from_numpy(
+                crop_resized).permute(2, 0, 1).float() / 255.0
             crop_tensor = crop_tensor.unsqueeze(0).to(self._device)
-            
+
             # Extract features using the backbone
             with torch.no_grad():
                 # Get features from the encoder
@@ -287,39 +291,40 @@ class RFDetrDetector:
                 else:
                     # Fallback: use the model's feature extraction
                     features = self._extract_features_simple(crop_tensor)
-                
+
                 # Global average pooling to get feature vector
                 if features.dim() == 4:  # [B, C, H, W]
                     features = F.adaptive_avg_pool2d(features, (1, 1))
                     features = features.view(features.size(0), -1)
-                
+
                 # L2 normalize for cosine similarity
                 features = F.normalize(features, p=2, dim=1)
-                
+
             return features.cpu().numpy().squeeze()
-            
+
         except Exception as e:
             logger.warning(f"Feature extraction failed: {e}")
             return None
 
     def _extract_features_simple(self, tensor: torch.Tensor) -> torch.Tensor:
         """Simple feature extraction as fallback.
-        
+
         Runs partial forward pass through the model to get features.
         """
         # Hook to capture intermediate features
         features = []
-        
+
         def hook_fn(module, input, output):
             features.append(output)
-        
+
         # Register hook on the first transformer layer or backbone output
         if hasattr(self._model.model, 'transformer'):
-            handle = self._model.model.transformer.encoder.layers[0].register_forward_hook(hook_fn)
+            handle = self._model.model.transformer.encoder.layers[0].register_forward_hook(
+                hook_fn)
         else:
             # Use input as features (fallback)
             return tensor
-        
+
         try:
             # Forward pass to trigger hook
             _ = self._model.model(tensor)
@@ -331,34 +336,35 @@ class RFDetrDetector:
             handle.remove()
 
     def compute_feature_similarity(
-        self, 
-        det1: DetectedObject, 
+        self,
+        det1: DetectedObject,
         det2: DetectedObject
     ) -> float:
         """Compute cosine similarity between two detections' features.
-        
+
         Args:
             det1: First detected object with features
             det2: Second detected object with features
-            
+
         Returns:
             Cosine similarity score (0-1), higher = more similar
         """
         if not det1.has_features() or not det2.has_features():
             return 0.0
-        
+
         feat1 = det1.features
         feat2 = det2.features
-        
+
         # Ensure 1D vectors
         if feat1.ndim > 1:
             feat1 = feat1.flatten()
         if feat2.ndim > 1:
             feat2 = feat2.flatten()
-        
+
         # Cosine similarity
-        similarity = np.dot(feat1, feat2) / (np.linalg.norm(feat1) * np.linalg.norm(feat2) + 1e-8)
-        
+        similarity = np.dot(feat1, feat2) / \
+            (np.linalg.norm(feat1) * np.linalg.norm(feat2) + 1e-8)
+
         return float(similarity)
 
     def is_same_object(
@@ -370,47 +376,47 @@ class RFDetrDetector:
         distance_threshold: float = 100.0,
     ) -> bool:
         """Check if two detections represent the same object instance.
-        
+
         Uses a multi-criteria approach:
         1. IoU (bbox overlap) for spatial matching
         2. Deep feature similarity for appearance matching
         3. Center distance for motion consistency
-        
+
         This handles occlusion by falling back to feature matching when
         bboxes don't overlap well.
-        
+
         Args:
             det1: First detection
             det2: Second detection
             iou_threshold: Minimum IoU for spatial match
             feature_threshold: Minimum feature similarity for appearance match
             distance_threshold: Maximum center distance in pixels
-            
+
         Returns:
             True if detections likely represent the same physical object
         """
         # Different classes can never be the same object
         if det1.label != det2.label:
             return False
-        
+
         # Compute center distance
         c1x = det1.bbox.x + det1.bbox.width / 2
         c1y = det1.bbox.y + det1.bbox.height / 2
         c2x = det2.bbox.x + det2.bbox.width / 2
         c2y = det2.bbox.y + det2.bbox.height / 2
         distance = ((c1x - c2x) ** 2 + (c1y - c2y) ** 2) ** 0.5
-        
+
         # Compute IoU
         x1_1, y1_1 = det1.bbox.x, det1.bbox.y
         x2_1, y2_1 = det1.bbox.x + det1.bbox.width, det1.bbox.y + det1.bbox.height
         x1_2, y2_1 = det2.bbox.x, det2.bbox.y
         x2_2, y2_2 = det2.bbox.x + det2.bbox.width, det2.bbox.y + det2.bbox.height
-        
+
         xi1 = max(x1_1, x1_2)
         yi1 = max(y1_1, y2_1)
         xi2 = min(x2_1, x2_2)
         yi2 = min(y2_1, y2_2)
-        
+
         if xi2 <= xi1 or yi2 <= yi1:
             iou = 0.0
         else:
@@ -419,28 +425,29 @@ class RFDetrDetector:
             area2 = (x2_2 - x1_2) * (y2_2 - y2_1)
             union = area1 + area2 - intersection
             iou = intersection / union if union > 0 else 0.0
-        
+
         # Criteria 1: Strong IoU match
         if iou >= iou_threshold and distance <= distance_threshold:
             return True
-        
+
         # Criteria 2: Feature similarity (handles occlusion)
         if det1.has_features() and det2.has_features():
             feature_sim = self.compute_feature_similarity(det1, det2)
             if feature_sim >= feature_threshold and distance <= distance_threshold * 1.5:
-                logger.debug(f"Matched by features: similarity={feature_sim:.3f}")
+                logger.debug(
+                    f"Matched by features: similarity={feature_sim:.3f}")
                 return True
-        
+
         return False
 
     def detect_batch(
         self, frames: list[bytes | NDArray[np.uint8]]
     ) -> list[list[DetectedObject]]:
         """Detect objects in multiple frames.
-        
+
         Args:
             frames: List of video frames
-            
+
         Returns:
             List of detection results for each frame
         """
@@ -452,10 +459,10 @@ class RFDetrDetector:
 
     def _bytes_to_numpy(self, frame_bytes: bytes) -> NDArray[np.uint8]:
         """Convert frame bytes to numpy array.
-        
+
         Args:
             frame_bytes: Raw frame data
-            
+
         Returns:
             Frame as numpy array
         """
