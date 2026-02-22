@@ -1,6 +1,8 @@
 """FastAPI application and routes."""
 
 from __future__ import annotations
+from cctv_search.search.algorithm import BoundingBox as SearchBBox
+from cctv_search.search.algorithm import BackwardTemporalSearch, ObjectDetection
 
 import io
 import logging
@@ -13,7 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from cctv_search.ai import BoundingBox, ByteTrackTracker, DetectedObject, RFDetrDetector
+from cctv_search.ai import BoundingBox, DetectedObject, FeatureTracker, RFDetrDetector
 from cctv_search.nvr import DahuaNVRClient
 
 logger = logging.getLogger(__name__)
@@ -32,7 +34,7 @@ logger.setLevel(logging.INFO)
 # Global state
 nvr_client: DahuaNVRClient | None = None
 detector: RFDetrDetector | None = None
-tracker: ByteTrackTracker | None = None
+tracker: FeatureTracker | None = None
 
 
 @asynccontextmanager
@@ -41,8 +43,8 @@ async def lifespan(app: FastAPI):
     # Startup
     global nvr_client, detector, tracker
     nvr_client = DahuaNVRClient()
-    detector = RFDetrDetector()
-    tracker = ByteTrackTracker(track_thresh=0.5, track_buffer=30, frame_rate=20)
+    detector = RFDetrDetector(confidence_threshold=0.1, nms_threshold=0.90)
+    tracker = FeatureTracker()
     # Load RF-DETR model on startup (optional - may fail if not installed)
     try:
         detector.load_model()
@@ -149,7 +151,8 @@ class ObjectSearchRequest(BaseModel):
     camera_id: str  # Channel number as string
     start_timestamp: datetime  # Starting point for backward search
     object_id: int  # Track ID from frame detection
-    search_duration_seconds: int = 3600  # How far back to search (default 1 hour)
+    # How far back to search (default 1 hour)
+    search_duration_seconds: int = 3600
     # Object details for matching (from frame detection)
     object_label: str  # e.g., "person", "bicycle"
     object_bbox: dict[str, float]  # {x, y, width, height}
@@ -182,7 +185,8 @@ class ObjectSearchResponse(BaseModel):
 async def extract_frame(request: FrameExtractRequest) -> FrameExtractResponse:
     """Extract a frame at the specified timestamp."""
     if not nvr_client:
-        raise HTTPException(status_code=500, detail="NVR client not initialized")
+        raise HTTPException(
+            status_code=500, detail="NVR client not initialized")
 
     try:
         frame_path = nvr_client.extract_frame(
@@ -202,7 +206,8 @@ async def extract_frame(request: FrameExtractRequest) -> FrameExtractResponse:
 async def detect_objects(request: DetectionRequest) -> list[DetectedObjectResponse]:
     """Detect objects in a video frame."""
     if not nvr_client:
-        raise HTTPException(status_code=500, detail="NVR client not initialized")
+        raise HTTPException(
+            status_code=500, detail="NVR client not initialized")
 
     try:
         # Check timestamp first
@@ -213,12 +218,14 @@ async def detect_objects(request: DetectionRequest) -> list[DetectedObjectRespon
 
         # Check detector availability
         if not detector:
-            raise HTTPException(status_code=500, detail="Detector not initialized")
+            raise HTTPException(
+                status_code=500, detail="Detector not initialized")
 
         # Extract frame
         nvr_client.extract_frame(
             timestamp=request.timestamp,
-            channel=int(request.camera_id) if request.camera_id.isdigit() else 1,
+            channel=int(
+                request.camera_id) if request.camera_id.isdigit() else 1,
         )
         # TODO: Load frame from file and run detection
         # For now, return empty list
@@ -255,7 +262,8 @@ def annotate_frame_with_objects(
 
             # Try to get a font, fall back to default if not available
             try:
-                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
+                font = ImageFont.truetype(
+                    "/System/Library/Fonts/Helvetica.ttc", 16)
             except OSError:
                 font = ImageFont.load_default()
 
@@ -353,14 +361,15 @@ def annotate_video_clip(
 
         # Setup video writer
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(str(output_path), fourcc, video_fps, (width, height))
+        out = cv2.VideoWriter(str(output_path), fourcc,
+                              video_fps, (width, height))
 
         # Color palette
         colors = {
             "person": (0, 255, 0),      # Green
             "bicycle": (255, 0, 0),     # Blue
             "car": (0, 0, 255),         # Red
-            "motorcycle": (255, 255, 0), # Cyan
+            "motorcycle": (255, 255, 0),  # Cyan
             "bus": (255, 0, 255),       # Magenta
             "truck": (0, 255, 255),     # Yellow
         }
@@ -402,7 +411,8 @@ def annotate_video_clip(
                     if track.is_active and track.label == target_label:
                         cx = track.x
                         cy = track.y
-                        distance = ((cx - target_cx) ** 2 + (cy - target_cy) ** 2) ** 0.5
+                        distance = ((cx - target_cx) ** 2 +
+                                    (cy - target_cy) ** 2) ** 0.5
 
                         if distance < best_distance:
                             best_distance = distance
@@ -480,7 +490,8 @@ def annotate_video_clip(
             # Progress logging every 50 frames
             if frame_idx % 50 == 0:
                 progress = (frame_idx / total_frames) * 100
-                logger.info(f"  Annotating: {frame_idx}/{total_frames} frames ({progress:.1f}%)")
+                logger.info(
+                    f"  Annotating: {frame_idx}/{total_frames} frames ({progress:.1f}%)")
 
         # Cleanup
         cap.release()
@@ -519,7 +530,8 @@ async def get_frame_with_objects(
     global tracker
 
     if not nvr_client:
-        raise HTTPException(status_code=500, detail="NVR client not initialized")
+        raise HTTPException(
+            status_code=500, detail="NVR client not initialized")
 
     # Check if detector is available
     if not detector:
@@ -567,7 +579,8 @@ async def get_frame_with_objects(
             objects_with_id.append(obj_with_id)
 
         # Step 5: Annotate image
-        annotated_bytes = annotate_frame_with_objects(frame_path, objects_with_id)
+        annotated_bytes = annotate_frame_with_objects(
+            frame_path, objects_with_id)
 
         # Save annotated image to frames directory
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -588,7 +601,8 @@ async def get_frame_with_objects(
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.exception("Failed to process frame with object detection")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}") from e
+        raise HTTPException(
+            status_code=500, detail=f"Processing failed: {e}") from e
 
 
 # Storage configuration
@@ -629,7 +643,8 @@ async def generate_video_clip(request: VideoClipRequest) -> VideoClipResponse:
         HTTPException: If NVR client is not initialized or clip extraction fails
     """
     if not nvr_client:
-        raise HTTPException(status_code=500, detail="NVR client not initialized")
+        raise HTTPException(
+            status_code=500, detail="NVR client not initialized")
 
     # Validate request parameters
     if request.duration_seconds <= 0:
@@ -651,7 +666,8 @@ async def generate_video_clip(request: VideoClipRequest) -> VideoClipResponse:
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Generate unique filename
-    clip_filename = _generate_clip_filename(request.camera_id, request.start_timestamp)
+    clip_filename = _generate_clip_filename(
+        request.camera_id, request.start_timestamp)
     clip_path = CLIPS_DIR / clip_filename
 
     try:
@@ -664,11 +680,11 @@ async def generate_video_clip(request: VideoClipRequest) -> VideoClipResponse:
         channel = int(request.camera_id) if request.camera_id.isdigit() else 1
 
         nvr_client.extract_clip(
-                start_time=request.start_timestamp,
-                end_time=end_timestamp,
-                channel=channel,
-                output_path=clip_path,
-            )
+            start_time=request.start_timestamp,
+            end_time=end_timestamp,
+            channel=channel,
+            output_path=clip_path,
+        )
 
         # Get file size
         file_size_bytes = clip_path.stat().st_size
@@ -702,13 +718,11 @@ async def generate_video_clip(request: VideoClipRequest) -> VideoClipResponse:
 
 
 # Import search algorithm types
-from cctv_search.search.algorithm import BackwardTemporalSearch, ObjectDetection
-from cctv_search.search.algorithm import BoundingBox as SearchBBox
 
 
 class NVRVideoDecoder:
     """Video decoder adapter for NVR client.
-    
+
     Adapts DahuaNVRClient to the VideoDecoder protocol expected by
     the search algorithm.
     """
@@ -744,7 +758,8 @@ class NVRVideoDecoder:
         frame_path = self._temp_dir / f"frame_{frame_index}.png"
 
         max_retries = 5
-        retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff: 2^0, 2^1, 2^2, 2^3, 2^4
+        # Exponential backoff: 2^0, 2^1, 2^2, 2^3, 2^4
+        retry_delays = [1, 2, 4, 8, 16]
 
         for attempt, delay in enumerate(retry_delays, 1):
             try:
@@ -762,7 +777,8 @@ class NVRVideoDecoder:
                         f"Retrying in {delay}s..."
                     )
                     try:
-                        self.nvr_client.extract_frame(retry_dt, self.channel, frame_path)
+                        self.nvr_client.extract_frame(
+                            retry_dt, self.channel, frame_path)
                         logger.info(
                             f"Successfully extracted frame {frame_index} at retry time {retry_dt.isoformat()} "
                             f"(attempt {attempt})"
@@ -784,7 +800,7 @@ class NVRVideoDecoder:
 
 class SearchObjectDetector:
     """Detector wrapper for search algorithm.
-    
+
     Wraps RFDetrDetector to match the ObjectDetector protocol expected
     by the search algorithm.
     """
@@ -898,7 +914,8 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
         HTTPException: If search fails or invalid parameters
     """
     if not nvr_client:
-        raise HTTPException(status_code=500, detail="NVR client not initialized")
+        raise HTTPException(
+            status_code=500, detail="NVR client not initialized")
 
     # Validate request
     if request.search_duration_seconds <= 0:
@@ -967,7 +984,8 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
             logger.info("=" * 70)
             logger.info(f"Camera ID: {request.camera_id}")
             logger.info(f"Start timestamp: {request.start_timestamp}")
-            logger.info(f"Object: {request.object_label} (ID: {request.object_id})")
+            logger.info(
+                f"Object: {request.object_label} (ID: {request.object_id})")
             logger.info(f"Search duration: {request.search_duration_seconds}s")
             logger.info(f"Bounding box: x={request.object_bbox['x']:.1f}, y={request.object_bbox['y']:.1f}, "
                         f"w={request.object_bbox['width']:.1f}, h={request.object_bbox['height']:.1f}")
@@ -1023,7 +1041,8 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
                 # Build RTSP playback URL for 15 seconds before first appearance
                 playback_start = first_seen - timedelta(seconds=15)
                 playback_end = first_seen  # End at the found timestamp
-                channel = int(request.camera_id) if request.camera_id.isdigit() else 1
+                channel = int(
+                    request.camera_id) if request.camera_id.isdigit() else 1
                 rtsp_url = nvr_client._build_rtsp_url_with_auth(
                     channel=channel,
                     start_time=playback_start,
@@ -1075,8 +1094,10 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
                 logger.info("SEARCH RESULT: NOT FOUND")
                 logger.info("=" * 70)
                 logger.info(f"Search iterations: {search_result.iterations}")
-                logger.info("Reason: Object not found in specified search window")
-                logger.info("Suggestion: The object may have appeared earlier than the search range")
+                logger.info(
+                    "Reason: Object not found in specified search window")
+                logger.info(
+                    "Suggestion: The object may have appeared earlier than the search range")
                 logger.info("=" * 70)
 
                 return ObjectSearchResponse(
@@ -1093,4 +1114,5 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
         raise
     except Exception as e:
         logger.exception("Object search failed")
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}") from e
+        raise HTTPException(
+            status_code=500, detail=f"Search failed: {e}") from e

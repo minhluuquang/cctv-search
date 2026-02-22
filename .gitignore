@@ -18,6 +18,7 @@ test_*.png
 
 # models
 rf-detr-base.pth
+rf-detr-large-2026.pth
 
 # Generated video clips
 clips/

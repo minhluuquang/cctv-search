@@ -1,16 +1,15 @@
-"""ByteTrack object tracker integration for CCTV search.
+"""Feature-based object tracker integration for CCTV search.
 
-This module provides the integration layer between ByteTrack (from cctv_search.ai)
-and the search algorithm. It converts ByteTrack tracks to the format expected
-by the search algorithm.
+This module provides the integration layer between the feature-based tracker
+(from cctv_search.ai) and the search algorithm.
 
-ByteTrack Installation:
-    pip install git+https://github.com/ifzhang/ByteTrack.git
+The tracker uses RF-DETR deep features for robust object matching,
+especially during occlusion scenarios.
 
 Usage:
-    from cctv_search.tracker import ByteTrackTracker, Detection
+    from cctv_search.tracker import FeatureTracker, Detection
     
-    tracker = ByteTrackTracker()
+    tracker = FeatureTracker()
     
     # Update with detections
     result = tracker.update(detections, frame_idx=100, timestamp=5.0)
@@ -37,8 +36,7 @@ logger = logging.getLogger(__name__)
 class Track:
     """Represents an object track across multiple frames.
     
-    This is a compatibility wrapper around ByteTrack's internal track format
-    for use with the search algorithm.
+    This is a compatibility wrapper for use with the search algorithm.
     """
     
     track_id: int
@@ -56,39 +54,37 @@ class Track:
 
 @dataclass
 class TrackerConfig:
-    """Configuration for ByteTrack tracker.
+    """Configuration for feature-based tracker.
     
     Attributes:
-        track_thresh: Detection confidence threshold for tracking
-        match_thresh: IoU threshold for matching
-        track_buffer: Maximum frames to keep lost tracks
-        frame_rate: Video frame rate
+        feature_threshold: Minimum cosine similarity for feature matching
+        iou_threshold: Minimum IoU for spatial matching
+        max_age: Maximum frames to keep lost tracks
     """
     
-    track_thresh: float = 0.5
-    match_thresh: float = 0.8
-    track_buffer: int = 30
-    frame_rate: int = 20
+    feature_threshold: float = 0.75
+    iou_threshold: float = 0.5
+    max_age: int = 30
 
 
-class ByteTrackTracker:
-    """ByteTrack tracker wrapper for CCTV search.
+class FeatureTracker:
+    """Feature-based tracker wrapper for CCTV search.
     
-    This class wraps the ByteTrack multi-object tracking algorithm from
-    cctv_search.ai and provides the interface expected by the search algorithm.
+    This class wraps the feature-based tracker from cctv_search.ai
+    and provides the interface expected by the search algorithm.
     
-    ByteTrack uses Kalman filter and Hungarian algorithm for robust tracking
-    of multiple objects across frames.
+    Uses RF-DETR deep features for robust object matching across frames,
+    especially during occlusion.
     
     Example:
-        >>> tracker = ByteTrackTracker()
+        >>> tracker = FeatureTracker()
         >>> result = tracker.update(detections, frame_idx=100, timestamp=5.0)
         >>> for track in result.matched:
         ...     print(f"Track {track.track_id}: {len(track.detections)} detections")
     """
     
     def __init__(self, config: TrackerConfig | None = None):
-        """Initialize ByteTrack tracker.
+        """Initialize feature-based tracker.
         
         Args:
             config: Tracker configuration
@@ -101,21 +97,20 @@ class ByteTrackTracker:
         self._load_tracker()
     
     def _load_tracker(self) -> None:
-        """Load ByteTrack tracker from ai module."""
+        """Load feature-based tracker from ai module."""
         try:
-            from cctv_search.ai import ByteTrackTracker as AiByteTracker
+            from cctv_search.ai import FeatureTracker as AiFeatureTracker
             
-            logger.info("Loading ByteTrack tracker...")
-            self._tracker = AiByteTracker(
-                track_thresh=self.config.track_thresh,
-                match_thresh=self.config.match_thresh,
-                track_buffer=self.config.track_buffer,
-                frame_rate=self.config.frame_rate,
+            logger.info("Loading FeatureTracker...")
+            self._tracker = AiFeatureTracker(
+                feature_threshold=self.config.feature_threshold,
+                iou_threshold=self.config.iou_threshold,
+                max_age=self.config.max_age,
             )
-            logger.info("ByteTrack tracker loaded successfully")
+            logger.info("FeatureTracker loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load ByteTrack: {e}")
-            raise RuntimeError(f"Failed to load ByteTrack: {e}") from e
+            logger.error(f"Failed to load FeatureTracker: {e}")
+            raise RuntimeError(f"Failed to load FeatureTracker: {e}") from e
     
     def update(
         self,
@@ -133,7 +128,7 @@ class ByteTrackTracker:
         Returns:
             AssociationResult with matched and unmatched tracks/detections
         """
-        from cctv_search.ai import DetectedObject, BoundingBox
+        from cctv_search.ai import BoundingBox, DetectedObject
         
         self._frame_count = frame_idx
         
@@ -151,10 +146,11 @@ class ByteTrackTracker:
                 ),
                 confidence=det.confidence,
                 frame_timestamp=timestamp,
+                features=getattr(det, "features", None),
             )
             ai_detections.append(ai_det)
         
-        # Update ByteTrack
+        # Update tracker
         tracks = self._tracker.update(ai_detections, frame_idx)
         
         # Convert to our Track format and build AssociationResult
@@ -210,8 +206,8 @@ class ByteTrackTracker:
     ) -> bool:
         """Check if two detections represent the same object instance.
         
-        This is the core "SameBike" predicate using ByteTrack's association logic.
-        Uses IoU and motion consistency for matching.
+        Uses feature similarity as primary criterion, falling back to
+        IoU and distance if features unavailable.
         
         Args:
             detection1: First detection
@@ -220,45 +216,8 @@ class ByteTrackTracker:
         Returns:
             True if detections likely represent the same physical object
         """
-        # Different classes can never be the same object
-        if detection1.class_label != detection2.class_label:
-            return False
-        
-        # Compute bounding box IoU
-        def compute_iou(box1, box2):
-            x1 = max(box1.x1, box2.x1)
-            y1 = max(box1.y1, box2.y1)
-            x2 = min(box1.x2, box2.x2)
-            y2 = min(box1.y2, box2.y2)
-            
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
-            
-            intersection = (x2 - x1) * (y2 - y1)
-            area1 = (box1.x2 - box1.x1) * (box1.y2 - box1.y1)
-            area2 = (box2.x2 - box2.x1) * (box2.y2 - box2.y1)
-            union = area1 + area2 - intersection
-            
-            return intersection / union if union > 0 else 0.0
-        
-        # Compute center distance
-        def center_distance(box1, box2):
-            c1x = (box1.x1 + box1.x2) / 2
-            c1y = (box1.y1 + box1.y2) / 2
-            c2x = (box2.x1 + box2.x2) / 2
-            c2y = (box2.y1 + box2.y2) / 2
-            return ((c1x - c2x) ** 2 + (c1y - c2y) ** 2) ** 0.5
-        
-        # Check IoU
-        iou = compute_iou(detection1.bbox, detection2.bbox)
-        iou_match = iou >= self.config.match_thresh
-        
-        # Check motion consistency (distance)
-        distance = center_distance(detection1.bbox, detection2.bbox)
-        motion_match = distance <= 50.0  # 50 pixel threshold
-        
-        # Both must pass (AND logic)
-        return iou_match and motion_match
+        # Delegate to the ai tracker
+        return self._tracker.is_same_object(detection1, detection2)
     
     def reset(self) -> None:
         """Reset tracker state."""
@@ -287,5 +246,4 @@ class AssociationResult:
         self.unmatched_detections = unmatched_detections or []
 
 
-# Backward compatibility
-MockByteTrackTracker = ByteTrackTracker
+

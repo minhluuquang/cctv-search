@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Target object data from user
 TARGET_OBJECT = {
     "camera_id": "1",
-    "start_timestamp": "2026-02-19T08:30:00",
+    "start_timestamp": "2026-02-19T10:30:00",
     "object_id": 2,
     "search_duration_seconds": 3600,
     "object_label": "motorcycle",
@@ -43,7 +43,7 @@ TARGET_OBJECT = {
 
 def test_matching():
     """Test object matching against test images."""
-    from cctv_search.ai import ByteTrackTracker, RFDetrDetector
+    from cctv_search.ai import FeatureTracker, RFDetrDetector
     from cctv_search.api import SearchObjectTracker
 
     # Initialize detector and tracker
@@ -56,8 +56,12 @@ def test_matching():
         logger.error(f"Failed to load detector: {e}")
         return
 
-    logger.info("Initializing ByteTrack tracker...")
-    tracker = ByteTrackTracker(track_thresh=0.5, track_buffer=30, frame_rate=20)
+    logger.info("Initializing FeatureTracker...")
+    tracker = FeatureTracker(
+        feature_threshold=0.75,
+        iou_threshold=0.8,
+        max_age=30,
+    )
 
     # Create search tracker wrapper with strict matching
     search_tracker = SearchObjectTracker(
@@ -115,7 +119,8 @@ def test_matching():
             d for d in detections
             if d.label.lower() == TARGET_OBJECT["object_label"].lower()
         ]
-        logger.info(f"  {len(matching_label)} with label '{TARGET_OBJECT['object_label']}'")
+        logger.info(
+            f"  {len(matching_label)} with label '{TARGET_OBJECT['object_label']}'")
 
         # Check for match using is_same_object
         best_match = None
@@ -139,18 +144,19 @@ def test_matching():
                 )
 
                 # Check if same object
-                is_match = search_tracker.is_same_object(target_detection, det_obj)
+                is_match = search_tracker.is_same_object(
+                    target_detection, det_obj)
 
                 # Calculate IoU and distance for reporting
                 iou = target_detection.bbox.iou_with(det_obj.bbox)
                 center1 = target_detection.bbox.center
                 center2 = det_obj.bbox.center
                 distance = ((center1.x - center2.x) ** 2 +
-                           (center1.y - center2.y) ** 2) ** 0.5
+                            (center1.y - center2.y) ** 2) ** 0.5
 
                 logger.info(f"  Candidate {i+1}:")
                 logger.info(f"    BBox: x={det.bbox.x:.1f}, y={det.bbox.y:.1f}, "
-                           f"w={det.bbox.width:.1f}, h={det.bbox.height:.1f}")
+                            f"w={det.bbox.width:.1f}, h={det.bbox.height:.1f}")
                 logger.info(f"    IoU: {iou:.3f}")
                 logger.info(f"    Center distance: {distance:.1f}px")
                 logger.info(f"    is_same_object: {is_match}")
@@ -184,21 +190,23 @@ def test_matching():
     logger.info("=" * 70)
     logger.info(f"Target object: {TARGET_OBJECT['object_label']} "
                 f"(ID: {TARGET_OBJECT['object_id']})")
-    logger.info(f"Target bbox: {json.dumps(TARGET_OBJECT['object_bbox'], indent=2)}")
+    logger.info(
+        f"Target bbox: {json.dumps(TARGET_OBJECT['object_bbox'], indent=2)}")
     logger.info("\nResults by image:")
 
     for r in results:
         status = "✓ MATCH" if r["match_found"] else "✗ No match"
         logger.info(f"  {r['image']}: {status}")
         logger.info(f"    Detections: {r['total_detections']}, "
-                   f"Label matches: {r['matching_label_count']}")
+                    f"Label matches: {r['matching_label_count']}")
         if r["best_match"]:
             logger.info(f"    Best IoU: {r['best_match']['iou']:.3f}, "
-                       f"Distance: {r['best_match']['distance']:.1f}px")
+                        f"Distance: {r['best_match']['distance']:.1f}px")
 
     # Overall result
     matches_found = sum(1 for r in results if r["match_found"])
-    logger.info(f"\nOverall: {matches_found}/{len(results)} images contain matching object")
+    logger.info(
+        f"\nOverall: {matches_found}/{len(results)} images contain matching object")
 
 
 if __name__ == "__main__":

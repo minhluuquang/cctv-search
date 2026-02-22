@@ -346,7 +346,9 @@ def backward_search(
 
     try:
         # === PHASE 1: Coarse Sampling (300 second / 5 minute steps) ===
-        logger.debug("Phase 1: Coarse sampling (30 second steps)")
+        logger.info("=" * 70)
+        logger.info("PHASE 1: Coarse sampling (300 second / 5 minute steps)")
+        logger.info("=" * 70)
 
         step = coarse_step
         current_frame = frame_at_target
@@ -378,9 +380,12 @@ def backward_search(
             else:
                 if found_any:
                     # Found gap after having found object!
-                    logger.debug(
-                        f"Phase 1: Gap found between frames {check_idx} "
-                        f"and {last_known_frame}"
+                    gap_start_ts = video_source.frame_to_timestamp(check_idx)
+                    gap_end_ts = video_source.frame_to_timestamp(last_known_frame)
+                    logger.info(
+                        f"Phase 1: Gap found! Object disappeared between "
+                        f"{datetime.fromtimestamp(gap_start_ts).isoformat()} and "
+                        f"{datetime.fromtimestamp(gap_end_ts).isoformat()}"
                     )
                     break
                 else:
@@ -416,7 +421,9 @@ def backward_search(
             )
 
         # === PHASE 2: Binary Search (find exact boundary) ===
-        logger.debug("Phase 2: Binary search to find exact boundary")
+        logger.info("=" * 70)
+        logger.info("PHASE 2: Binary search (finding exact boundary)")
+        logger.info("=" * 70)
 
         # Search range from Phase 1
         left = current_frame - step   # No object here (gap_start)
@@ -425,18 +432,31 @@ def backward_search(
         # Target precision: 5 seconds in frames
         precision_frames = int(5 * fps_float)
         
-        logger.debug(f"Binary search range: frames {left} to {right} ({right - left} frames)")
+        left_ts = video_source.frame_to_timestamp(left)
+        right_ts = video_source.frame_to_timestamp(right)
+        logger.info(
+            f"Binary search range: {datetime.fromtimestamp(left_ts).isoformat()} to "
+            f"{datetime.fromtimestamp(right_ts).isoformat()} ({right - left} frames, "
+            f"target precision: {precision_frames} frames)"
+        )
         
         # Binary search to find exact boundary within 5-second precision
+        phase2_iterations = 0
         while right - left > precision_frames:
             mid = (left + right) // 2
+            phase2_iterations += 1
+            
+            mid_ts = video_source.frame_to_timestamp(mid)
+            logger.info(f"Phase 2 iteration {phase2_iterations}: checking frame {mid} ({datetime.fromtimestamp(mid_ts).isoformat()})")
             
             if check_frame(mid):
                 # Object exists, move left boundary
                 right = mid
+                logger.info(f"  -> Object found, narrowing to earlier time")
             else:
                 # No object, move right boundary
                 left = mid
+                logger.info(f"  -> Object not found, narrowing to later time")
         
         # 'left' is now within 5 seconds of the first appearance boundary
         result_frame = left

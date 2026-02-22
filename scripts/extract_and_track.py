@@ -151,19 +151,18 @@ def process_video_with_tracking(
     import cv2
     import numpy as np
     
-    from cctv_search.ai import RFDetrDetector, ByteTrackTracker, BoundingBox, DetectedObject
+    from cctv_search.ai import RFDetrDetector, FeatureTracker, BoundingBox, DetectedObject
     
     # Initialize detector and tracker
     logger.info(f"Initializing detector (confidence: {confidence_threshold})...")
     detector = RFDetrDetector(confidence_threshold=confidence_threshold)
     detector.load_model()
     
-    logger.info("Initializing ByteTrack tracker...")
-    tracker = ByteTrackTracker(
-        track_thresh=confidence_threshold,
-        match_thresh=0.8,
-        track_buffer=30,
-        frame_rate=fps,
+    logger.info("Initializing FeatureTracker...")
+    tracker = FeatureTracker(
+        feature_threshold=0.75,
+        iou_threshold=0.8,
+        max_age=30,
     )
     
     # Open video

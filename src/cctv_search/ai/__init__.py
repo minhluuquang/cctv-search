@@ -3,20 +3,27 @@
 This module provides real-time object detection using RF-DETR,
 a transformer-based detection model optimized for CCTV footage.
 
-Example:
-    from cctv_search.ai import RFDetrDetector
+Features:
+- Deep feature extraction for robust object matching
+- Occlusion handling via feature similarity
+- Feature-based tracking (replaces ByteTrack/BoT-SORT)
+
+Usage:
+    from cctv_search.ai import RFDetrDetector, FeatureTracker
     
     detector = RFDetrDetector()
     detector.load_model()
     
-    detections = detector.detect(frame)
-    for det in detections:
-        print(f"{det.label}: {det.confidence:.2f}")
+    # Detect with features
+    detections = detector.detect_with_features(frame)
+    
+    # Match objects across frames
+    tracker = FeatureTracker()
+    tracks = tracker.update(detections, frame_idx=0)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Protocol
 
 
@@ -24,46 +31,10 @@ __all__ = [
     "BoundingBox",
     "DetectedObject",
     "RFDetrDetector",
-    "ByteTrackTracker",
+    "FeatureTracker",
     "Track",
     "ObjectDetector",
 ]
-
-
-@dataclass
-class BoundingBox:
-    """Bounding box for detected objects.
-    
-    Attributes:
-        x: Left coordinate
-        y: Top coordinate
-        width: Box width
-        height: Box height
-        confidence: Detection confidence (0-1)
-    """
-
-    x: float
-    y: float
-    width: float
-    height: float
-    confidence: float
-
-
-@dataclass
-class DetectedObject:
-    """Represents a detected object in video.
-    
-    Attributes:
-        label: Object class label (e.g., "bicycle", "person")
-        bbox: Bounding box coordinates
-        confidence: Detection confidence score
-        frame_timestamp: Frame timestamp in seconds
-    """
-
-    label: str
-    bbox: BoundingBox
-    confidence: float
-    frame_timestamp: float
 
 
 class ObjectDetector(Protocol):
@@ -73,13 +44,13 @@ class ObjectDetector(Protocol):
         """Load detection model."""
         ...
 
-    def detect(self, frame: bytes) -> list[DetectedObject]:
+    def detect(self, frame: bytes) -> list["DetectedObject"]:
         """Detect objects in a video frame."""
         ...
 
 
-# Import RF-DETR detector after defining types to avoid circular imports
-from cctv_search.ai.rf_detr import RFDetrDetector
+# Import all classes from rf_detr
+from cctv_search.ai.rf_detr import BoundingBox, DetectedObject, RFDetrDetector
 
-# Import ByteTrack tracker
-from cctv_search.ai.byte_tracker import ByteTrackTracker, Track
+# Import feature-based tracker
+from cctv_search.ai.byte_tracker import FeatureTracker, Track

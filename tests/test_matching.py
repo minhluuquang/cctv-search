@@ -1,18 +1,22 @@
-"""Tests for object matching logic (SameBike predicate) using ByteTrack."""
+"""Tests for object matching logic using FeatureTracker."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from cctv_search.ai import ByteTrackTracker
+from cctv_search.ai import FeatureTracker
 from cctv_search.detector import BoundingBox, Detection
 
 
 @pytest.fixture
 def tracker():
-    """Create ByteTrack tracker instance."""
-    return ByteTrackTracker(match_thresh=0.8)
+    """Create FeatureTracker instance."""
+    return FeatureTracker(
+        feature_threshold=0.75,
+        iou_threshold=0.5,
+        max_age=30,
+    )
 
 
 @pytest.fixture
@@ -295,7 +299,11 @@ class TestThresholdValidation:
 
     def test_high_iou_threshold_rejects_partial_overlap(self):
         """Test that high IoU threshold rejects partial overlaps."""
-        tracker = ByteTrackTracker(match_thresh=0.9)  # Very strict
+        tracker = FeatureTracker(
+            feature_threshold=0.75,
+            iou_threshold=0.9,  # Very strict
+            max_age=30,
+        )
 
         target = Detection(
             bbox=BoundingBox(x1=100, y1=100, x2=150, y2=130),
@@ -321,7 +329,11 @@ class TestThresholdValidation:
 
     def test_strict_iou_threshold_accepts_match(self):
         """Test tracker accepts match when IoU is above threshold."""
-        tracker = ByteTrackTracker(match_thresh=0.5)
+        tracker = FeatureTracker(
+            feature_threshold=0.75,
+            iou_threshold=0.5,
+            max_age=30,
+        )
 
         target = Detection(
             bbox=BoundingBox(x1=100, y1=100, x2=150, y2=130),
@@ -369,7 +381,11 @@ class TestEdgeCases:
         )
 
         # Non-overlapping bboxes should not match
-        tracker = ByteTrackTracker(match_thresh=0.8)
+        tracker = FeatureTracker(
+            feature_threshold=0.75,
+            iou_threshold=0.8,
+            max_age=30,
+        )
         result = tracker.is_same_object(det1, det2)
         assert result is False
 

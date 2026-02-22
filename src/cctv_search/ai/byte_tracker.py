@@ -1,39 +1,38 @@
-"""ByteTrack-style object tracker implementation using roboflow/trackers.
+"""Feature-based object tracker using RF-DETR deep embeddings.
 
-This module provides a wrapper around the official roboflow/trackers ByteTrack
-implementation, adapting it to work with the cctv_search DetectedObject format.
+This module provides tracking without traditional multi-object trackers like
+ByteTrack or BoT-SORT. Instead, it uses deep feature embeddings from RF-DETR
+to match objects across frames.
 
-The algorithm uses:
-- Kalman filter for motion prediction
-- Hungarian algorithm for data association
-- Two-stage matching (high/low confidence)
+This approach is:
+- More robust to occlusion (features persist when bbox changes)
+- Simpler (no Kalman filters or motion models)
+- Consistent with detection (uses same features)
 
 Usage:
-    from cctv_search.ai.byte_tracker import ByteTrackTracker, Track
-
-    tracker = ByteTrackTracker()
+    from cctv_search.ai.tracker import FeatureTracker, Track
+    
+    tracker = FeatureTracker(detector=rf_detr_detector)
     tracks = tracker.update(detections, frame_idx=100)
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import supervision as sv
-from trackers import ByteTrackTracker as _ByteTrackTracker
 
 if TYPE_CHECKING:
-    from cctv_search.ai import DetectedObject
+    from cctv_search.ai import DetectedObject, RFDetrDetector
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Track:
-    """Represents a tracked object.
+    """Represents a tracked object across frames.
 
     Attributes:
         track_id: Unique track identifier
@@ -45,8 +44,7 @@ class Track:
         confidence: Detection confidence
         frame_idx: Frame where track was updated
         is_active: Whether track is currently active
-        is_activated: Whether track has been confirmed
-        state: Track state ('tracked', 'lost', or 'removed')
+        features: Deep feature embedding for matching
     """
 
     track_id: int
@@ -62,6 +60,7 @@ class Track:
     state: str = "tracked"
     age: int = 0
     hits: int = 0
+    features: np.ndarray | None = field(default=None, repr=False)
 
     def update(self, detection: DetectedObject, frame_idx: int) -> None:
         """Update track with new detection."""
@@ -74,7 +73,8 @@ class Track:
         self.hits += 1
         self.age = 0
         self.is_active = True
-        if self.hits >= 3:  # Activate after 3 hits
+        self.features = detection.features
+        if self.hits >= 2:  # Activate after 2 hits
             self.is_activated = True
 
     def predict(self) -> None:
@@ -90,57 +90,50 @@ class Track:
         self.is_active = False
 
 
-class ByteTrackTracker:
-    """ByteTrack multi-object tracker using roboflow/trackers.
+class FeatureTracker:
+    """Feature-based object tracker using RF-DETR embeddings.
 
-    Wrapper around the official ByteTrack implementation that adapts it
-    to work with cctv_search's DetectedObject format.
+    Matches objects across frames using deep feature similarity from RF-DETR
+    instead of motion-based tracking. This handles occlusion better because
+    features persist even when objects overlap or are partially hidden.
 
     Example:
-        >>> tracker = ByteTrackTracker(track_thresh=0.5)
-        >>> detections = [
-        ...     DetectedObject(label="person", bbox=bbox, confidence=0.9, ...)
-        ... ]
+        >>> tracker = FeatureTracker(detector=rf_detr_detector)
+        >>> detections = detector.detect_with_features(frame)
         >>> tracks = tracker.update(detections, frame_idx=100)
     """
 
     def __init__(
         self,
-        track_thresh: float = 0.5,
-        match_thresh: float = 0.8,
-        track_buffer: int = 30,
-        frame_rate: int = 20,
+        detector: RFDetrDetector | None = None,
+        feature_threshold: float = 0.75,
+        iou_threshold: float = 0.5,
+        distance_threshold: float = 100.0,
+        max_age: int = 30,
     ):
-        """Initialize ByteTrack tracker.
+        """Initialize feature-based tracker.
 
         Args:
-            track_thresh: Detection confidence threshold for first matching
-            match_thresh: IoU threshold for matching (kept for API compatibility)
-            track_buffer: Maximum frames to keep lost tracks
-            frame_rate: Video frame rate
+            detector: RF-DETR detector for feature extraction (optional)
+            feature_threshold: Minimum cosine similarity for feature matching
+            iou_threshold: Minimum IoU for spatial matching
+            distance_threshold: Maximum center distance in pixels
+            max_age: Maximum frames to keep lost tracks
         """
-        self.track_thresh = track_thresh
-        self.match_thresh = match_thresh
-        self.track_buffer = track_buffer
-        self.frame_rate = frame_rate
+        self.detector = detector
+        self.feature_threshold = feature_threshold
+        self.iou_threshold = iou_threshold
+        self.distance_threshold = distance_threshold
+        self.max_age = max_age
 
-        # Initialize the official ByteTrack tracker
-        # Note: track_activation_threshold corresponds to track_thresh
-        self._tracker = _ByteTrackTracker(
-            lost_track_buffer=track_buffer,
-            frame_rate=float(frame_rate),
-            track_activation_threshold=track_thresh,
-            minimum_consecutive_frames=2,
-            minimum_iou_threshold=0.1,
-            high_conf_det_threshold=0.6,
-        )
-
+        self._tracks: dict[int, Track] = {}
+        self._next_track_id: int = 1
         self._frame_count: int = 0
 
-        # Keep track of detection-to-track mappings
-        self._label_map: dict[int, str] = {}
-
-        logger.info(f"ByteTrack tracker initialized (thresh={track_thresh})")
+        logger.info(
+            f"FeatureTracker initialized "
+            f"(feature_thresh={feature_threshold}, iou_thresh={iou_threshold})"
+        )
 
     def update(
         self,
@@ -149,8 +142,12 @@ class ByteTrackTracker:
     ) -> list[Track]:
         """Update tracker with new detections.
 
+        Matches detections to existing tracks using:
+        1. Feature similarity (primary, handles occlusion)
+        2. IoU overlap (secondary, spatial consistency)
+
         Args:
-            detections: List of detections from current frame
+            detections: List of detections with features from RF-DETR
             frame_idx: Current frame index
 
         Returns:
@@ -158,134 +155,150 @@ class ByteTrackTracker:
         """
         self._frame_count = frame_idx
 
-        if not detections:
-            # Process empty frame to let tracker handle lost tracks
-            empty_detections = sv.Detections(
-                xyxy=np.empty((0, 4)),
-                confidence=np.empty(0),
-                class_id=np.empty(0, dtype=int),
-            )
-            _ = self._tracker.update(empty_detections)
-            return []
+        # Age all existing tracks
+        for track in self._tracks.values():
+            if track.is_active:
+                track.predict()
 
-        # Convert DetectedObject list to supervision.Detections
-        sv_detections = self._to_sv_detections(detections)
+        # Match detections to tracks
+        matched_tracks: list[tuple[Track, DetectedObject]] = []
+        unmatched_detections: list[DetectedObject] = []
 
-        # Run the official tracker
-        tracked_detections = self._tracker.update(sv_detections)
+        # Get active tracks
+        active_tracks = [t for t in self._tracks.values() if t.is_active]
 
-        # Convert back to Track objects
-        tracks = self._to_tracks(tracked_detections, frame_idx)
+        # Match each detection to best track
+        detection_matched = [False] * len(detections)
 
-        return tracks
+        for det_idx, detection in enumerate(detections):
+            best_track = None
+            best_score = -1.0
 
-    def _to_sv_detections(self, detections: list[DetectedObject]) -> sv.Detections:
-        """Convert DetectedObject list to supervision.Detections.
+            for track in active_tracks:
+                # Skip if already matched this iteration
+                if any(t.track_id == track.track_id for t, _ in matched_tracks):
+                    continue
 
-        Args:
-            detections: List of DetectedObject
+                # Check class consistency
+                if track.label != detection.label:
+                    continue
 
-        Returns:
-            supervision.Detections object
-        """
-        if not detections:
-            return sv.Detections(
-                xyxy=np.empty((0, 4)),
-                confidence=np.empty(0),
-                class_id=np.empty(0, dtype=int),
-            )
+                # Compute matching score
+                score = self._compute_match_score(track, detection)
 
-        xyxy_list = []
-        confidence_list = []
-        class_id_list = []
-        label_map = {}
+                if score > best_score and score > 0.5:  # Minimum threshold
+                    best_score = score
+                    best_track = track
 
-        for _i, det in enumerate(detections):
-            # Convert bbox (x, y, width, height) to xyxy (x1, y1, x2, y2)
-            x1 = det.bbox.x
-            y1 = det.bbox.y
-            x2 = det.bbox.x + det.bbox.width
-            y2 = det.bbox.y + det.bbox.height
-            xyxy_list.append([x1, y1, x2, y2])
+            if best_track is not None:
+                matched_tracks.append((best_track, detection))
+                detection_matched[det_idx] = True
+            else:
+                unmatched_detections.append(detection)
 
-            confidence_list.append(det.confidence)
+        # Update matched tracks
+        for track, detection in matched_tracks:
+            track.update(detection, frame_idx)
 
-            # Map labels to class IDs
-            # Use a simple hash-based mapping for consistency
-            label_hash = hash(det.label) % 10000
-            class_id_list.append(label_hash)
-            label_map[label_hash] = det.label
-
-        self._label_map = label_map
-
-        return sv.Detections(
-            xyxy=np.array(xyxy_list),
-            confidence=np.array(confidence_list),
-            class_id=np.array(class_id_list, dtype=int),
-        )
-
-    def _to_tracks(
-        self, detections: sv.Detections, frame_idx: int
-    ) -> list[Track]:
-        """Convert supervision.Detections to Track objects.
-
-        Args:
-            detections: Tracked detections with tracker_id
-            frame_idx: Current frame index
-
-        Returns:
-            List of Track objects
-        """
-        tracks: list[Track] = []
-
-        if detections.is_empty():
-            return tracks
-
-        tracker_ids = detections.tracker_id
-        if tracker_ids is None:
-            return tracks
-
-        confidences = detections.confidence
-        class_ids = detections.class_id
-        if confidences is None or class_ids is None:
-            return tracks
-
-        for i in range(len(detections)):
-            xyxy = detections.xyxy[i]
-            confidence = confidences[i]
-            class_id = class_ids[i]
-            tracker_id = tracker_ids[i]
-
-            # Skip tracks that haven't been activated yet (tracker_id < 0)
-            if tracker_id < 0:
-                continue
-
-            # Convert xyxy back to center x, y, width, height
-            x1, y1, x2, y2 = xyxy
-            width = x2 - x1
-            height = y2 - y1
-            x = x1 + width / 2
-            y = y1 + height / 2
-
-            # Get label from mapping or use class_id as string
-            label = self._label_map.get(int(class_id), f"class_{class_id}")
-
-            track = Track(
-                track_id=int(tracker_id),
-                label=label,
-                x=float(x),
-                y=float(y),
-                width=float(width),
-                height=float(height),
-                confidence=float(confidence),
+        # Create new tracks for unmatched detections
+        for detection in unmatched_detections:
+            new_track = Track(
+                track_id=self._next_track_id,
+                label=detection.label,
+                x=detection.bbox.x + detection.bbox.width / 2,
+                y=detection.bbox.y + detection.bbox.height / 2,
+                width=detection.bbox.width,
+                height=detection.bbox.height,
+                confidence=detection.confidence,
                 frame_idx=frame_idx,
                 is_active=True,
-                is_activated=True,  # Official tracker handles activation internally
-                state="tracked",
+                is_activated=False,
+                features=detection.features,
             )
-            tracks.append(track)
+            self._tracks[self._next_track_id] = new_track
+            self._next_track_id += 1
 
-        return tracks
+        # Remove old tracks
+        tracks_to_remove = []
+        for track_id, track in self._tracks.items():
+            if track.age > self.max_age:
+                track.mark_removed()
+                tracks_to_remove.append(track_id)
+
+        for track_id in tracks_to_remove:
+            del self._tracks[track_id]
+
+        # Return active tracks
+        return [t for t in self._tracks.values() if t.is_active]
+
+    def _compute_match_score(self, track: Track, detection: DetectedObject) -> float:
+        """Compute matching score between track and detection.
+
+        Combines feature similarity, IoU, and distance into single score.
+
+        Returns:
+            Score between 0 and 1, higher = better match
+        """
+        scores = []
+
+        # Feature similarity (most important for occlusion)
+        if track.features is not None and detection.has_features():
+            feat_sim = self._compute_feature_similarity(track.features, detection.features)
+            scores.append(feat_sim * 0.6)  # 60% weight
+
+        # IoU
+        iou = self._compute_iou(track, detection)
+        scores.append(iou * 0.25)  # 25% weight
+
+        # Distance
+        distance = self._compute_distance(track, detection)
+        distance_score = max(0, 1 - distance / self.distance_threshold)
+        scores.append(distance_score * 0.15)  # 15% weight
+
+        return sum(scores) if scores else 0.0
+
+    def _compute_feature_similarity(
+        self, feat1: np.ndarray, feat2: np.ndarray
+    ) -> float:
+        """Compute cosine similarity between two feature vectors."""
+        feat1 = feat1.flatten()
+        feat2 = feat2.flatten()
+        return float(
+            np.dot(feat1, feat2) / (np.linalg.norm(feat1) * np.linalg.norm(feat2) + 1e-8)
+        )
+
+    def _compute_iou(self, track: Track, detection: DetectedObject) -> float:
+        """Compute IoU between track and detection bounding boxes."""
+        x1_t = track.x - track.width / 2
+        y1_t = track.y - track.height / 2
+        x2_t = track.x + track.width / 2
+        y2_t = track.y + track.height / 2
+
+        x1_d = detection.bbox.x
+        y1_d = detection.bbox.y
+        x2_d = detection.bbox.x + detection.bbox.width
+        y2_d = detection.bbox.y + detection.bbox.height
+
+        xi1 = max(x1_t, x1_d)
+        yi1 = max(y1_t, y1_d)
+        xi2 = min(x2_t, x2_d)
+        yi2 = min(y2_t, y2_d)
+
+        if xi2 <= xi1 or yi2 <= yi1:
+            return 0.0
+
+        intersection = (xi2 - xi1) * (yi2 - yi1)
+        area_t = track.width * track.height
+        area_d = detection.bbox.width * detection.bbox.height
+        union = area_t + area_d - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+    def _compute_distance(self, track: Track, detection: DetectedObject) -> float:
+        """Compute center distance between track and detection."""
+        det_x = detection.bbox.x + detection.bbox.width / 2
+        det_y = detection.bbox.y + detection.bbox.height / 2
+        return ((track.x - det_x) ** 2 + (track.y - det_y) ** 2) ** 0.5
 
     def is_same_object(
         self,
@@ -294,7 +307,8 @@ class ByteTrackTracker:
     ) -> bool:
         """Check if two detections represent the same object instance.
 
-        This is the core "SameBike" predicate using IoU and motion consistency.
+        Uses feature similarity as primary criterion, falling back to
+        IoU and distance if features unavailable.
 
         Args:
             detection1: First detection
@@ -303,91 +317,115 @@ class ByteTrackTracker:
         Returns:
             True if detections likely represent the same physical object
         """
-        from cctv_search.ai import BoundingBox
+        from cctv_search.ai import DetectedObject
 
-        # Handle both Detection objects and DetectedObject objects
-        def get_bbox(det):
-            if hasattr(det, "bbox"):
-                return det.bbox
-            return det
-
-        def get_label(det):
-            if hasattr(det, "label"):
-                return det.label
-            if hasattr(det, "class_label"):
-                return det.class_label
-            return None
-
-        bbox1 = get_bbox(detection1)
-        bbox2 = get_bbox(detection2)
-        label1 = get_label(detection1)
-        label2 = get_label(detection2)
+        # Handle different input types
+        if not isinstance(detection1, DetectedObject):
+            detection1 = self._convert_to_detected_object(detection1)
+        if not isinstance(detection2, DetectedObject):
+            detection2 = self._convert_to_detected_object(detection2)
 
         # Different classes can never be the same object
-        if label1 is not None and label2 is not None and label1 != label2:
+        if detection1.label != detection2.label:
             return False
 
-        # Convert to BoundingBox if needed
+        # Try feature matching first (best for occlusion)
+        if detection1.has_features() and detection2.has_features():
+            similarity = self._compute_feature_similarity(
+                detection1.features, detection2.features
+            )
+            if similarity >= self.feature_threshold:
+                return True
+
+        # Fall back to IoU + distance
+        iou = self._compute_iou_between_detections(detection1, detection2)
+        distance = self._compute_distance_between_detections(detection1, detection2)
+
+        return iou >= self.iou_threshold and distance <= self.distance_threshold
+
+    def _convert_to_detected_object(self, obj: Any) -> DetectedObject:
+        """Convert various detection formats to DetectedObject."""
+        from cctv_search.ai import BoundingBox, DetectedObject
+
+        if hasattr(obj, "bbox"):
+            bbox = obj.bbox
+            if not hasattr(bbox, "width"):
+                # Convert x1,y1,x2,y2 to x,y,width,height
+                bbox = BoundingBox(
+                    x=getattr(bbox, "x", getattr(bbox, "x1", 0)),
+                    y=getattr(bbox, "y", getattr(bbox, "y1", 0)),
+                    width=getattr(bbox, "width", getattr(bbox, "x2", 0) - getattr(bbox, "x1", 0)),
+                    height=getattr(bbox, "height", getattr(bbox, "y2", 0) - getattr(bbox, "y1", 0)),
+                    confidence=getattr(bbox, "confidence", 0.5),
+                )
+            return DetectedObject(
+                label=getattr(obj, "label", getattr(obj, "class_label", "unknown")),
+                bbox=bbox,
+                confidence=getattr(obj, "confidence", 0.5),
+                frame_timestamp=getattr(obj, "frame_timestamp", 0.0),
+                features=getattr(obj, "features", None),
+            )
+        else:
+            raise ValueError(f"Cannot convert {type(obj)} to DetectedObject")
+
+    def _compute_iou_between_detections(
+        self, det1: DetectedObject, det2: DetectedObject
+    ) -> float:
+        """Compute IoU between two detections (handles both xywh and xyxy formats)."""
+        # Handle different bbox formats
         def get_coords(bbox):
-            if isinstance(bbox, BoundingBox):
-                x1 = bbox.x
-                y1 = bbox.y
-                x2 = bbox.x + bbox.width
-                y2 = bbox.y + bbox.height
+            if hasattr(bbox, 'x1') and hasattr(bbox, 'x2'):
+                # xyxy format (x1, y1, x2, y2) - from detector module
+                return bbox.x1, bbox.y1, bbox.x2, bbox.y2
+            elif hasattr(bbox, 'x') and hasattr(bbox, 'width'):
+                # xywh format - from ai module
+                return bbox.x, bbox.y, bbox.x + bbox.width, bbox.y + bbox.height
             else:
-                x1 = bbox.x1 if hasattr(bbox, "x1") else bbox.x
-                y1 = bbox.y1 if hasattr(bbox, "y1") else bbox.y
-                x2 = bbox.x2 if hasattr(bbox, "x2") else bbox.x + bbox.width
-                y2 = bbox.y2 if hasattr(bbox, "y2") else bbox.y + bbox.height
-            return x1, y1, x2, y2
+                raise ValueError(f"Unknown bbox format: {type(bbox)}")
+        
+        x1_1, y1_1, x2_1, y2_1 = get_coords(det1.bbox)
+        x1_2, y1_2, x2_2, y2_2 = get_coords(det2.bbox)
 
-        x1_1, y1_1, x2_1, y2_1 = get_coords(bbox1)
-        x1_2, y1_2, x2_2, y2_2 = get_coords(bbox2)
-
-        # Compute bounding box IoU
         xi1 = max(x1_1, x1_2)
         yi1 = max(y1_1, y1_2)
         xi2 = min(x2_1, x2_2)
         yi2 = min(y2_1, y2_2)
 
         if xi2 <= xi1 or yi2 <= yi1:
-            iou = 0.0
-        else:
-            intersection = (xi2 - xi1) * (yi2 - yi1)
-            area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-            area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-            union = area1 + area2 - intersection
-            iou = intersection / union if union > 0 else 0.0
+            return 0.0
 
-        # Compute center distance
-        c1x = (x1_1 + x2_1) / 2
-        c1y = (y1_1 + y2_1) / 2
-        c2x = (x1_2 + x2_2) / 2
-        c2y = (y1_2 + y2_2) / 2
-        distance = ((c1x - c2x) ** 2 + (c1y - c2y) ** 2) ** 0.5
+        intersection = (xi2 - xi1) * (yi2 - yi1)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
 
-        # Check thresholds
-        iou_match = iou >= self.match_thresh
-        motion_match = distance <= 50.0  # 50 pixel threshold
+        return intersection / union if union > 0 else 0.0
 
-        # Both must pass (AND logic)
-        return iou_match and motion_match
+    def _compute_distance_between_detections(
+        self, det1: DetectedObject, det2: DetectedObject
+    ) -> float:
+        """Compute center distance between two detections (handles both bbox formats)."""
+        def get_center(bbox):
+            if hasattr(bbox, 'x1') and hasattr(bbox, 'x2'):
+                # xyxy format (x1, y1, x2, y2) - from detector module
+                return (bbox.x1 + bbox.x2) / 2, (bbox.y1 + bbox.y2) / 2
+            elif hasattr(bbox, 'x') and hasattr(bbox, 'width'):
+                # xywh format - from ai module
+                return bbox.x + bbox.width / 2, bbox.y + bbox.height / 2
+            else:
+                raise ValueError(f"Unknown bbox format: {type(bbox)}")
+        
+        c1x, c1y = get_center(det1.bbox)
+        c2x, c2y = get_center(det2.bbox)
+        return ((c1x - c2x) ** 2 + (c1y - c2y) ** 2) ** 0.5
 
     def reset(self) -> None:
         """Reset tracker state."""
-        # Re-initialize the official tracker
-        self._tracker = _ByteTrackTracker(
-            lost_track_buffer=self.track_buffer,
-            frame_rate=float(self.frame_rate),
-            track_activation_threshold=self.track_thresh,
-            minimum_consecutive_frames=2,
-            minimum_iou_threshold=0.1,
-            high_conf_det_threshold=0.6,
-        )
+        self._tracks.clear()
+        self._next_track_id = 1
         self._frame_count = 0
-        self._label_map = {}
-        logger.info("Tracker reset")
+        logger.info("FeatureTracker reset")
 
 
-# Backward compatibility alias
-ByteTrack = ByteTrackTracker
+
+Track = Track
