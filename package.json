@@ -1,0 +1,31 @@
+{
+  "name": "cctv-search-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CCTV Search - AI-powered video analysis with FastAPI and Next.js",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "format": "turbo run format",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "api:dev": "cd apps/api && uv run uvicorn cctv_search.api:app --reload --host 0.0.0.0 --port 8000",
+    "api:lint": "cd apps/api && uv run ruff check .",
+    "api:format": "cd apps/api && uv run ruff format .",
+    "api:test": "cd apps/api && uv run pytest",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:build": "docker-compose build"
+  },
+  "devDependencies": {
+    "turbo": "^2.4.0",
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}

@@ -1,53 +1,169 @@
 # CCTV Search
 
-A FastAPI-based server for searching CCTV footage using AI object detection and tracking.
+A FastAPI-based server for searching CCTV footage using AI object detection and tracking, with a modern Next.js frontend.
 
 ## Architecture
 
+This is a **monorepo** containing:
+
+- **API** (`apps/api/`): FastAPI backend for video management and AI analysis
+- **Web** (`apps/web/`): Next.js 15 frontend with shadcn/ui
+
+### Tech Stack
+
+**Backend:**
 - **FastAPI Server**: HTTP API for video management and AI analysis
 - **NVR Module**: Connect to Network Video Recorders (Dahua/Hikvision support)
-- **AI Module**: Object detection using RF-DETR models with deep feature extraction
-- **Tracker Module**: Multi-object tracking with feature-based matching using RF-DETR embeddings
-- **Search Module**: Backward temporal search for finding objects in video
+- **AI Module**: Object detection using RF-DETR models
+- **Tracker Module**: Feature-based tracking using deep embeddings
+- **Search Module**: Backward temporal search algorithm
+
+**Frontend:**
+- **Next.js 15**: React framework with App Router
+- **TypeScript**: Type-safe development
+- **shadcn/ui**: Modern UI components
+- **TanStack Query**: Server state management
+- **Tailwind CSS**: Utility-first styling
 
 ## Requirements
 
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) - Modern Python package manager
-- FFmpeg (for frame and video extraction from RTSP streams)
+- **Node.js**: 20+ (with pnpm 9+)
+- **Python**: 3.12+
+- **Package Manager**: [uv](https://docs.astral.sh/uv/) for Python, pnpm for Node.js
 
 ## Setup
 
+### 1. Clone and Install
+
 ```bash
-# Install dependencies
+# Clone repository
+git clone <repository-url>
+cd cctv-search
+
+# Install Node.js dependencies
+pnpm install
+
+# Install Python dependencies
+cd apps/api
 uv sync --dev
-
-# Activate virtual environment
-source .venv/bin/activate
+cd ../..
 ```
 
-## Configuration
+### 2. Configuration
 
-Copy `.env.example` to `.env` and configure:
+Create a `.env` file in the root:
 
 ```bash
-# Dahua NVR Configuration
-NVR_HOST=192.168.1.220        # Your NVR IP address
-NVR_PORT=554                  # RTSP port (default: 554)
-NVR_USERNAME=admin            # NVR username
-NVR_PASSWORD=your_password    # NVR password
-NVR_CHANNEL=1                 # Default camera channel
-RTSP_TRANSPORT=tcp            # tcp or udp
+# NVR Configuration
+NVR_HOST=192.168.1.220
+NVR_PORT=554
+NVR_USERNAME=admin
+NVR_PASSWORD=your_password
+NVR_CHANNEL=1
+RTSP_TRANSPORT=tcp
+
+# Frontend
+API_URL=http://localhost:8000
 ```
 
-## Usage
+Copy to API app:
+```bash
+cp .env apps/api/.env
+```
+
+## Development
+
+### Option 1: Using Turbo (Recommended)
 
 ```bash
-# Run the server
-uv run cctv-search
+# Start all services
+pnpm dev
 
-# Or with uvicorn directly (with reload)
-uv run uvicorn cctv_search.api:app --reload
+# Or start individually
+pnpm api:dev      # Backend only
+pnpm --filter @cctv-search/web dev  # Frontend only
+```
+
+### Option 2: Using Docker Compose
+
+```bash
+# Build and start all services
+pnpm docker:up
+
+# View logs
+pnpm docker:logs
+
+# Stop services
+pnpm docker:down
+```
+
+### Option 3: Manual
+
+**Terminal 1 - API:**
+```bash
+cd apps/api
+uv run uvicorn cctv_search.api:app --reload --host 0.0.0.0 --port 8000
+```
+
+**Terminal 2 - Web:**
+```bash
+cd apps/web
+pnpm dev
+```
+
+## Project Structure
+
+```
+cctv-search/
+├── apps/
+│   ├── api/                    # FastAPI backend
+│   │   ├── src/cctv_search/    # Source code
+│   │   ├── tests/              # Test suite
+│   │   ├── docs/               # Documentation
+│   │   ├── scripts/            # Utility scripts
+│   │   ├── pyproject.toml      # Python dependencies
+│   │   └── Dockerfile
+│   └── web/                    # Next.js frontend
+│       ├── app/                # App Router pages
+│       ├── components/         # React components
+│       ├── lib/                # Utilities
+│       ├── package.json
+│       └── Dockerfile
+├── packages/
+│   └── shared-types/           # Shared TypeScript types
+│       ├── src/
+│       └── package.json
+├── package.json                # Root workspace config
+├── pnpm-workspace.yaml         # pnpm workspace definition
+├── turbo.json                  # Turbo pipeline config
+├── docker-compose.yml          # Local development
+└── README.md
+```
+
+## Available Scripts
+
+**Root:**
+```bash
+pnpm dev          # Start all services with Turbo
+pnpm build        # Build all apps
+pnpm lint         # Lint all apps
+pnpm test         # Run all tests
+pnpm clean        # Clean build artifacts
+```
+
+**API:**
+```bash
+pnpm api:dev      # Start FastAPI dev server
+pnpm api:lint     # Run ruff linter
+pnpm api:format   # Run ruff formatter
+pnpm api:test     # Run pytest
+```
+
+**Docker:**
+```bash
+pnpm docker:up    # Start all services
+pnpm docker:down  # Stop services
+pnpm docker:build # Rebuild images
 ```
 
 ## API Endpoints
@@ -73,9 +189,9 @@ Real-time object detection using RF-DETR transformer model with:
 - Support for multiple object classes (person, bicycle, car, etc.)
 - Configurable confidence thresholds
 
-### Multi-Object Tracking
-Feature-based tracking with:
-- Deep feature embeddings from RF-DETR for matching
+### Feature-Based Tracking
+Custom tracking implementation using:
+- Deep feature embeddings from RF-DETR
 - Track ID assignment and maintenance
 - Robust to occlusion using cosine similarity
 
@@ -87,86 +203,35 @@ Efficient coarse-to-fine search algorithm:
 
 Result: ~99% reduction in AI model calls vs naive frame-by-frame search
 
-### Video Clip Generation
-Extract video segments from NVR using FFmpeg with:
-- Configurable duration (up to 5 minutes)
-- Direct RTSP playback integration
-- Automatic annotation of tracked objects
+## Development Guidelines
 
-## Development
+See `apps/api/AGENTS.md` for:
+- Python code style guidelines
+- Testing procedures
+- Linting and formatting commands
+
+### Adding New Components
 
 ```bash
-# Run tests
-uv run pytest
-
-# Run a single test
-uv run pytest tests/test_nvr.py::test_nvr_client_init_with_params -v
-
-# Lint code
-uv run ruff check .
-
-# Fix auto-fixable issues
-uv run ruff check . --fix
-
-# Format code
-uv run ruff format .
-
-# Add dependencies
-uv add <package>
-
-# Add dev dependencies
-uv add --dev <package>
+cd apps/web
+pnpm dlx shadcn@latest add <component-name>
 ```
 
-## Project Structure
+### Adding Shared Types
 
+```bash
+cd packages/shared-types
+# Edit src/index.ts
+pnpm build
 ```
-.
-├── pyproject.toml         # Project configuration
-├── uv.lock               # Dependency lock file
-├── README.md
-├── AGENTS.md             # AI coding agent guidelines
-├── src/
-│   └── cctv_search/
-│       ├── __init__.py      # Main entry point
-│       ├── api/             # FastAPI routes and endpoints
-│       ├── nvr/             # NVR client modules (Dahua)
-│       ├── ai/              # AI/ML modules (RF-DETR, FeatureTracker)
-│       ├── search/          # Video search algorithms
-│       ├── detector.py      # Detector integration
-│       └── tracker.py       # Tracker integration
-├── tests/                   # Test suite
-├── scripts/                 # Utility scripts
-│   ├── extract_and_track.py
-│   ├── extract_and_detect.py
-│   ├── test_connection.py
-│   ├── test_detector.py
-│   └── ...
-└── docs/                    # Documentation
-    ├── api-reference.md
-    ├── business-logic.md
-    ├── setup-configuration.md
-    └── technical-architecture.md
-```
-
-## Scripts
-
-The `scripts/` directory contains utility scripts for testing and development:
-
-- `extract_and_track.py` - Extract frames and track objects across video
-- `extract_and_detect.py` - Extract frames and detect objects
-- `test_connection.py` - Test NVR connection
-- `test_detector.py` - Test RF-DETR detection
-- `test_rfdetr.py` - Test RF-DETR model loading
-- `test_matching.py` - Test object matching logic
-- `test_extract_frame.py` - Test frame extraction
-- `test_nvr_diagnose.py` - NVR diagnostics
 
 ## Documentation
 
-- [API Reference](docs/api-reference.md) - Complete API documentation
-- [Business Logic](docs/business-logic.md) - Use cases and concepts
-- [Technical Architecture](docs/technical-architecture.md) - System design
-- [Setup & Configuration](docs/setup-configuration.md) - Installation guide
+- [API Documentation](apps/api/docs/api-reference.md)
+- [Business Logic](apps/api/docs/business-logic.md)
+- [Technical Architecture](apps/api/docs/technical-architecture.md)
+- [Setup Guide](apps/api/docs/setup-configuration.md)
 
-See `AGENTS.md` for detailed coding guidelines.
+## License
+
+[Add license information here]
