@@ -1,22 +1,25 @@
 """FastAPI application and routes."""
 
 from __future__ import annotations
-from cctv_search.search.algorithm import BoundingBox as SearchBBox
-from cctv_search.search.algorithm import BackwardTemporalSearch, ObjectDetection
 
 import io
 import logging
 import os
 import random
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from cctv_search.ai import BoundingBox, DetectedObject, FeatureTracker, RFDetrDetector
 from cctv_search.nvr import DahuaNVRClient
+from cctv_search.search.algorithm import BackwardTemporalSearch, ObjectDetection
+from cctv_search.search.algorithm import BoundingBox as SearchBBox
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +39,70 @@ nvr_client: DahuaNVRClient | None = None
 detector: RFDetrDetector | None = None
 tracker: FeatureTracker | None = None
 
+# HLS streams directory
+HLS_DIR = Path("/tmp/hls")
+HLS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class StreamManager:
+    """Manages active HLS streams."""
+
+    def __init__(self):
+        self.active_streams: dict[int, subprocess.Popen] = {}
+        self.hls_dir = HLS_DIR
+
+    def start_stream(self, channel: int, start_time: datetime | None = None) -> str:
+        """Start HLS stream for a channel.
+        
+        Args:
+            channel: Camera channel number
+            start_time: If provided, start playback from this time (playback mode)
+                       If None, stream live (live mode)
+        """
+        # Stop existing stream if any
+        self.stop_stream(channel)
+
+        # Start new stream
+        process, playlist_path = nvr_client.start_hls_stream(
+            channel=channel,
+            output_dir=self.hls_dir,
+            start_time=start_time,
+        )
+        self.active_streams[channel] = process
+
+        # Return relative URL path
+        return f"/hls/ch{channel}/playlist.m3u8"
+
+    def stop_stream(self, channel: int) -> None:
+        """Stop HLS stream for a channel."""
+        if channel in self.active_streams:
+            process = self.active_streams[channel]
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            del self.active_streams[channel]
+
+    def cleanup(self) -> None:
+        """Stop all streams."""
+        for channel in list(self.active_streams.keys()):
+            self.stop_stream(channel)
+
+
+# Global stream manager
+stream_manager: StreamManager | None = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan."""
     # Startup
-    global nvr_client, detector, tracker
+    global nvr_client, detector, tracker, stream_manager
     nvr_client = DahuaNVRClient()
     detector = RFDetrDetector()
     tracker = FeatureTracker()
+    stream_manager = StreamManager()
     # Load RF-DETR model on startup (optional - may fail if not installed)
     try:
         detector.load_model()
@@ -53,6 +111,8 @@ async def lifespan(app: FastAPI):
         detector = None
     yield
     # Shutdown
+    if stream_manager:
+        stream_manager.cleanup()
     # No disconnect needed for Dahua client
 
 
@@ -62,6 +122,37 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount HLS streams directory
+app.mount("/hls", StaticFiles(directory=str(HLS_DIR)), name="hls")
+
+
+# Pydantic models for streaming
+class StreamStartRequest(BaseModel):
+    """Request to start HLS stream."""
+    channel: int = 1
+    start_time: datetime | None = None  # If provided, playback from this time
+
+
+class StreamStartResponse(BaseModel):
+    """Response with HLS stream URL."""
+    playlist_url: str
+    channel: int
+    message: str
+
+
+class StreamStopRequest(BaseModel):
+    """Request to stop HLS stream."""
+    channel: int = 1
 
 
 # Pydantic models
@@ -114,12 +205,11 @@ class DetectedObjectWithId(BaseModel):
 
 
 class FrameObjectsResponse(BaseModel):
-    """Response with detected objects and annotated image path."""
+    """Response with detected objects."""
 
     timestamp: datetime
     channel: int
     objects: list[DetectedObjectWithId]
-    image_path: str  # Path where annotated image is saved
     total_objects: int
 
 
@@ -199,41 +289,6 @@ async def extract_frame(request: FrameExtractRequest) -> FrameExtractResponse:
             channel=request.channel,
         )
     except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.post("/ai/detect")
-async def detect_objects(request: DetectionRequest) -> list[DetectedObjectResponse]:
-    """Detect objects in a video frame."""
-    if not nvr_client:
-        raise HTTPException(
-            status_code=500, detail="NVR client not initialized")
-
-    try:
-        # Check timestamp first
-        if not request.timestamp:
-            raise HTTPException(
-                status_code=400, detail="Timestamp required for frame extraction"
-            )
-
-        # Check detector availability
-        if not detector:
-            raise HTTPException(
-                status_code=500, detail="Detector not initialized")
-
-        # Extract frame
-        nvr_client.extract_frame(
-            timestamp=request.timestamp,
-            channel=int(
-                request.camera_id) if request.camera_id.isdigit() else 1,
-        )
-        # TODO: Load frame from file and run detection
-        # For now, return empty list
-        return []
-
-    except HTTPException:
-        raise
-    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
@@ -509,20 +564,19 @@ def annotate_video_clip(
 async def get_frame_with_objects(
     request: FrameObjectsRequest,
 ) -> FrameObjectsResponse:
-    """Extract frame at timestamp, detect and track objects, save annotated image.
+    """Extract frame at timestamp from NVR and detect objects.
 
     Flow:
     1. Extract frame from NVR at specified timestamp and channel
     2. Run detection using detector.detect(frame_bytes)
     3. Run tracking using tracker.update(detections, frame_idx=0) to get track IDs
-    4. Draw bounding boxes with track IDs on the image
-    5. Save annotated image to ./frames/ directory and return path
+    4. Return detected objects with bounding boxes
 
     Args:
-        request: Frame extraction and object detection request.
+        request: Frame extraction and object detection request with timestamp and channel.
 
     Returns:
-        FrameObjectsResponse with detected objects and image file path.
+        FrameObjectsResponse with detected objects.
 
     Raises:
         HTTPException: If NVR client is not initialized or frame extraction fails.
@@ -578,22 +632,10 @@ async def get_frame_with_objects(
             )
             objects_with_id.append(obj_with_id)
 
-        # Step 5: Annotate image
-        annotated_bytes = annotate_frame_with_objects(
-            frame_path, objects_with_id)
-
-        # Save annotated image to frames directory
-        FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-        ts_str = request.timestamp.strftime("%Y%m%d_%H%M%S")
-        image_filename = f"frame_{ts_str}_ch{request.channel}.png"
-        image_path = FRAMES_DIR / image_filename
-        image_path.write_bytes(annotated_bytes)
-
         return FrameObjectsResponse(
             timestamp=request.timestamp,
             channel=request.channel,
             objects=objects_with_id,
-            image_path=str(image_path),
             total_objects=len(objects_with_id),
         )
 
@@ -607,7 +649,6 @@ async def get_frame_with_objects(
 
 # Storage configuration
 CLIPS_DIR = Path("./clips")
-FRAMES_DIR = Path("./frames")
 
 
 def _generate_clip_filename(camera_id: str, timestamp: datetime) -> str:
@@ -1116,3 +1157,148 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
         logger.exception("Object search failed")
         raise HTTPException(
             status_code=500, detail=f"Search failed: {e}") from e
+
+
+@app.post("/stream/start", response_model=StreamStartResponse)
+async def start_stream(request: StreamStartRequest) -> StreamStartResponse:
+    """Start HLS stream for a channel.
+
+    Transcodes RTSP stream to HLS for browser playback.
+    Supports both live streaming and playback from specific time.
+    Credentials are kept backend-only for security.
+
+    Args:
+        request: Stream start request with channel number and optional start time.
+
+    Returns:
+        StreamStartResponse with HLS playlist URL.
+
+    Raises:
+        HTTPException: If stream manager not initialized.
+    """
+    if not stream_manager:
+        raise HTTPException(
+            status_code=500, detail="Stream manager not initialized")
+
+    if not nvr_client:
+        raise HTTPException(
+            status_code=500, detail="NVR client not initialized")
+
+    try:
+        playlist_url = stream_manager.start_stream(
+            request.channel, request.start_time
+        )
+
+        mode = "playback" if request.start_time else "live"
+        return StreamStartResponse(
+            playlist_url=playlist_url,
+            channel=request.channel,
+            message=f"HLS {mode} stream started for channel {request.channel}",
+        )
+    except Exception as e:
+        logger.exception("Failed to start stream")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to start stream: {e}") from e
+
+
+@app.post("/stream/stop")
+async def stop_stream(request: StreamStopRequest) -> dict:
+    """Stop HLS stream for a channel.
+
+    Args:
+        request: Stream stop request with channel number.
+
+    Returns:
+        Success message.
+
+    Raises:
+        HTTPException: If stream manager not initialized.
+    """
+    if not stream_manager:
+        raise HTTPException(
+            status_code=500, detail="Stream manager not initialized")
+
+    try:
+        stream_manager.stop_stream(request.channel)
+        return {
+            "message": f"Stream stopped for channel {request.channel}",
+            "channel": request.channel,
+        }
+    except Exception as e:
+        logger.exception("Failed to stop stream")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to stop stream: {e}") from e
+
+
+@app.get("/stream/status")
+async def get_stream_status() -> dict:
+    """Get status of active streams.
+
+    Returns:
+        Dictionary with active channel list.
+    """
+    if not stream_manager:
+        return {"active_channels": []}
+
+    active_channels = list(stream_manager.active_streams.keys())
+    return {
+        "active_channels": active_channels,
+        "count": len(active_channels),
+    }
+
+
+@app.get("/stream/ready/{channel}")
+async def check_stream_ready(channel: int) -> dict:
+    """Check if a stream is ready to play.
+
+    Returns:
+        Dictionary with ready status and playlist URL if ready.
+    """
+    playlist_path = HLS_DIR / f"ch{channel}" / "playlist.m3u8"
+    
+    if playlist_path.exists():
+        # Check if file has content
+        size = playlist_path.stat().st_size
+        if size > 0:
+            return {
+                "ready": True,
+                "playlist_url": f"/hls/ch{channel}/playlist.m3u8",
+                "channel": channel,
+            }
+    
+    return {
+        "ready": False,
+        "playlist_url": None,
+        "channel": channel,
+    }
+
+
+@app.get("/nvr/status")
+async def get_nvr_status() -> dict:
+    """Get NVR connection status.
+
+    Returns:
+        Dictionary with NVR configuration and connection status.
+    """
+    if not nvr_client:
+        return {
+            "connected": False,
+            "error": "NVR client not initialized",
+            "config": {
+                "host": None,
+                "port": None,
+                "username": None,
+                "has_password": False,
+            }
+        }
+    
+    return {
+        "connected": True,
+        "config": {
+            "host": nvr_client.host if nvr_client.host else None,
+            "port": nvr_client.port,
+            "username": nvr_client.username if nvr_client.username else None,
+            "has_password": bool(nvr_client.password),
+        },
+        "message": "NVR client configured" if nvr_client.host else "NVR not configured - set NVR_HOST env var"
+    }

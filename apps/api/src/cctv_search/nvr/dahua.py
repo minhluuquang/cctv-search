@@ -6,7 +6,7 @@ import os
 import subprocess
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -48,6 +48,15 @@ class DahuaNVRClient:
         self.username = username or os.getenv("NVR_USERNAME", "")
         self.password = password or os.getenv("NVR_PASSWORD", "")
         self.rtsp_transport = rtsp_transport
+
+        print(f"[NVR] Initialized: host={self.host}, port={self.port}, "
+              f"user={self.username}")
+        if not self.host:
+            print("[NVR] WARNING: NVR_HOST not set!")
+        if not self.username:
+            print("[NVR] WARNING: NVR_USERNAME not set!")
+        if not self.password:
+            print("[NVR] WARNING: NVR_PASSWORD not set!")
 
     def _format_timestamp(self, dt: datetime) -> str:
         """Format datetime for Dahua RTSP endpoint (YYYY_MM_DD_HH_MM_SS)."""
@@ -214,3 +223,163 @@ class DahuaNVRClient:
             raise RuntimeError(f"Failed to extract clip: {e.stderr}") from e
 
         return output_path
+
+    def _build_live_rtsp_url(self, channel: int) -> str:
+        """Build RTSP live stream URL (real-time).
+
+        Dahua live stream URL format:
+        rtsp://<server>:[port]/cam/realmonitor?channel=<channel>&subtype=<0|1>
+        subtype=0 for main stream (higher quality), 1 for sub stream
+        """
+        return (
+            f"rtsp://{self.host}:{self.port}"
+            f"/cam/realmonitor?channel={channel}&subtype=0"
+        )
+
+    def start_hls_stream(
+        self,
+        channel: int = 1,
+        output_dir: str | Path = "/tmp/hls",
+        start_time: datetime | None = None,
+    ) -> tuple[subprocess.Popen, str]:
+        """Start HLS streaming from RTSP source.
+
+        Transcodes RTSP stream to HLS for browser playback.
+        Supports both live streaming and playback from specific time.
+
+        Args:
+            channel: Camera channel number (default: 1)
+            output_dir: Directory to save HLS files
+            start_time: If provided, start playback from this time (playback mode)
+                       If None, stream live (live mode)
+
+        Returns:
+            Tuple of (ffmpeg process, playlist path)
+        """
+        output_dir = Path(output_dir) / f"ch{channel}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build RTSP URL based on mode
+        if start_time:
+            # Playback mode - use playback URL with start time
+            # End time is 1 hour after start for playback
+            end_time = start_time + timedelta(hours=1)
+            rtsp_url = self._build_rtsp_url(channel, start_time, end_time)
+        else:
+            # Live mode - use live stream URL
+            rtsp_url = self._build_live_rtsp_url(channel)
+
+        # Add authentication to URL
+        encoded_username = urllib.parse.quote(self.username, safe="")
+        encoded_password = urllib.parse.quote(self.password, safe="")
+        auth_url = rtsp_url.replace(
+            f"rtsp://{self.host}:{self.port}",
+            f"rtsp://{encoded_username}:{encoded_password}@{self.host}:{self.port}",
+        )
+
+        playlist_path = output_dir / "playlist.m3u8"
+
+        # Clean up old segments to avoid confusion
+        for old_segment in output_dir.glob("segment_*.ts"):
+            old_segment.unlink()
+        if playlist_path.exists():
+            playlist_path.unlink()
+
+        # FFmpeg command to transcode RTSP to HLS
+        # Optimized for FAST START (low latency over stability)
+        cmd = [
+            "ffmpeg",
+            "-rtsp_transport", self.rtsp_transport,
+            # Buffer settings for input - smaller for faster start
+            "-thread_queue_size", "1024",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            # No -re flag - process as fast as possible for faster start
+            "-i", auth_url,
+            # Video codec settings - faster preset for speed
+            "-c:v", "libx264",
+            "-preset", "ultrafast",  # Fastest encoding
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-level", "3.0",
+            # Keyframe settings for HLS - every 2 seconds
+            "-g", "50",
+            "-keyint_min", "50",
+            "-sc_threshold", "0",
+            "-r", "25",
+            # HLS output settings - optimized for FAST START
+            "-f", "hls",
+            "-hls_time", "2",  # 2 second segments (faster start than 4)
+            "-hls_list_size", "6",  # Keep 6 segments (12 seconds)
+            # CRITICAL: append_list writes playlist after EACH segment
+            "-hls_flags", "independent_segments+delete_segments+append_list",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", str(output_dir / "segment_%03d.ts"),
+            "-start_number", "0",
+            "-hls_playlist_type", "event",
+            "-y",
+            str(playlist_path),
+        ]
+
+        # Start ffmpeg process
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Wait for playlist file to be created (with timeout)
+        import time
+        max_wait = 15  # 15 seconds max - should start in ~5-10s with optimized settings
+        waited = 0
+        first_segment = output_dir / "segment_000.ts"
+
+        print(f"[DEBUG] Starting ffmpeg for channel {channel}")
+        safe_url = auth_url.replace(self.password, '***')
+        print(f"[DEBUG] RTSP URL: {safe_url}")
+        print(f"[DEBUG] Playlist path: {playlist_path}")
+
+        while waited < max_wait:
+            time.sleep(0.5)
+            waited += 0.5
+
+            # Check if process is still running
+            if process.poll() is not None:
+                # Process exited early - there was an error
+                stdout, stderr = process.communicate()
+                error_msg = stderr.decode('utf-8', errors='ignore')[-1000:]
+                print(f"[DEBUG] FFmpeg stderr: {error_msg}")
+                raise RuntimeError(f"FFmpeg failed to start: {error_msg}")
+
+            # Check if both playlist and first segment exist and have content
+            if playlist_path.exists() and first_segment.exists():
+                playlist_size = playlist_path.stat().st_size
+                segment_size = first_segment.stat().st_size
+                if playlist_size > 0 and segment_size > 100000:  # At least 100KB
+                    print(f"[DEBUG] Stream ready after {waited}s")
+                    print(f"[DEBUG] Playlist: {playlist_size} bytes")
+                    print(f"[DEBUG] First segment: {segment_size} bytes")
+                    break
+
+            # Log progress every 5 seconds
+            if waited % 5 == 0:
+                # Check what files exist
+                files = list(output_dir.glob("*"))
+                print(f"[DEBUG] Waiting for stream... {waited}s elapsed")
+                print(f"[DEBUG] Files in output dir: {[f.name for f in files]}")
+
+        if not playlist_path.exists() or not first_segment.exists():
+            # Capture any output before terminating
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+                error_msg = stderr.decode('utf-8', errors='ignore')[-1000:]
+                print(f"[DEBUG] FFmpeg stderr on timeout: {error_msg}")
+            except subprocess.TimeoutExpired:
+                pass
+            process.terminate()
+            raise RuntimeError(
+                f"Timeout waiting for HLS stream after {max_wait}s. "
+                "Check NVR connection and credentials."
+            )
+
+        return process, str(playlist_path)
