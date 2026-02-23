@@ -2,7 +2,7 @@
 
 import { useRef, useState, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Scan, Play, Pause } from "lucide-react";
+import { Play, Pause } from "lucide-react";
 
 // Helper function to format seconds to MM:SS
 function formatTime(seconds: number): string {
@@ -10,6 +10,14 @@ function formatTime(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+}
+
+// Helper function to format timestamp to HH:MM:SS
+function formatTimestamp(date: Date): string {
+  const hours = date.getHours().toString().padStart(2, "0");
+  const minutes = date.getMinutes().toString().padStart(2, "0");
+  const seconds = date.getSeconds().toString().padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
 }
 
 interface BoundingBox {
@@ -30,7 +38,6 @@ interface DetectedObject {
 interface VideoPlayerProps {
   streamUrl: string | null;
   channel: number;
-  onFrameFreeze: (videoElement: HTMLVideoElement | null) => void;
   highlightedObjectId: number | null;
   detectedObjects: DetectedObject[];
   isLoading?: boolean;
@@ -40,12 +47,17 @@ interface VideoPlayerProps {
   streamMode?: "live" | "playback";
   onPauseStream?: () => void;
   onResumeStream?: () => void;
+  playbackStartTime?: string;
+  onSeek?: (newStartTime: string) => void;
+  onClearDetectedObjects?: () => void;
 }
+
+// Constants
+const ONE_DAY_SECONDS = 24 * 60 * 60; // 86400 seconds
 
 export function VideoPlayer({
   streamUrl,
   channel,
-  onFrameFreeze,
   highlightedObjectId,
   detectedObjects,
   isLoading = false,
@@ -55,6 +67,9 @@ export function VideoPlayer({
   streamMode = "live",
   onPauseStream,
   onResumeStream,
+  playbackStartTime,
+  onSeek,
+  onClearDetectedObjects,
 }: VideoPlayerProps) {
   const internalVideoRef = useRef<HTMLVideoElement>(null);
   const videoRef = externalVideoRef || internalVideoRef;
@@ -62,12 +77,11 @@ export function VideoPlayer({
   const containerRef = useRef<HTMLDivElement>(null);
   const [isFrozen, setIsFrozen] = useState(false);
   const [isPlaying, setIsPlaying] = useState(true);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [seekableStart, setSeekableStart] = useState(0);
-  const [seekableEnd, setSeekableEnd] = useState(0);
+  const [sliderValue, setSliderValue] = useState(0); // 0 to ONE_DAY_SECONDS for playback
   const [isDragging, setIsDragging] = useState(false);
   const progressRef = useRef<HTMLDivElement>(null);
+  const videoStartTimeRef = useRef<number>(0);
+  const accumulatedSeekRef = useRef<number>(0);
   // Fixed detection resolution - NVR streams and detects at 1920x1080
   const DETECTION_WIDTH = 1920;
   const DETECTION_HEIGHT = 1080;
@@ -170,44 +184,72 @@ export function VideoPlayer({
     drawBoundingBoxes();
   }, [drawBoundingBoxes]);
 
+  // Get slider max value based on mode
+  const getSliderMax = () => {
+    return streamMode === 'playback' ? ONE_DAY_SECONDS : 0;
+  };
+
+  // Calculate current slider position for playback mode
+  // Returns seconds elapsed since playbackStartTime
+  const calculateSliderPosition = () => {
+    if (streamMode === 'live') return 0;
+    
+    const video = videoRef.current;
+    if (!video || !playbackStartTime) return 0;
+    
+    // Get the actual timestamp the video is currently showing
+    // This is playbackStartTime + video elapsed time
+    const videoElapsedTime = video.currentTime;
+    const totalElapsedSeconds = videoElapsedTime + accumulatedSeekRef.current;
+    
+    return Math.min(ONE_DAY_SECONDS, Math.max(0, totalElapsedSeconds));
+  };
+
   // Handle video metadata loaded
   const handleLoadedMetadata = () => {
     const video = videoRef.current;
     if (!video) return;
-    // Video metadata loaded - detection resolution is fixed at 1920x1080
     console.log(`[Video] Metadata loaded: ${video.videoWidth}x${video.videoHeight}`);
-    setDuration(video.duration || 0);
-    updateSeekableRange();
+    videoStartTimeRef.current = video.currentTime;
   };
 
-  // Update seekable range for live streams
-  const updateSeekableRange = () => {
-    const video = videoRef.current;
-    if (!video) return;
-    
-    if (video.seekable.length > 0) {
-      setSeekableStart(video.seekable.start(0));
-      setSeekableEnd(video.seekable.end(0));
+  // Reset accumulated seek when stream URL changes (new stream started)
+  useEffect(() => {
+    accumulatedSeekRef.current = 0;
+    // Reset slider to 0 when new stream starts
+    if (streamMode === 'playback') {
+      setSliderValue(0);
     }
-  };
+    // Reset frozen state when stream stops (streamUrl becomes null)
+    if (!streamUrl) {
+      setIsFrozen(false);
+    }
+  }, [streamUrl, streamMode]);
 
   // Handle time update
   const handleTimeUpdate = () => {
     if (isDragging) return;
     const video = videoRef.current;
     if (!video) return;
-    setCurrentTime(video.currentTime);
-    updateSeekableRange();
+    
+    if (streamMode === 'playback') {
+      setSliderValue(calculateSliderPosition());
+    }
   };
 
   // Handle play/pause toggle
   const togglePlayPause = () => {
     const video = videoRef.current;
     if (!video) return;
-    
+
     if (video.paused) {
       video.play();
       setIsPlaying(true);
+      // Clear frozen state and detected objects when resuming playback
+      if (isFrozen) {
+        setIsFrozen(false);
+        onClearDetectedObjects?.();
+      }
       onResumeStream?.();
     } else {
       video.pause();
@@ -218,11 +260,8 @@ export function VideoPlayer({
 
   // Handle seeking via slider
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const video = videoRef.current;
-    if (!video) return;
-    
-    const seekTime = parseFloat(e.target.value);
-    setCurrentTime(seekTime);
+    const newValue = parseFloat(e.target.value);
+    setSliderValue(newValue);
   };
 
   // Handle seek start (mouse down on slider)
@@ -237,11 +276,15 @@ export function VideoPlayer({
   // Handle seek end (mouse up on slider)
   const handleSeekEnd = () => {
     setIsDragging(false);
-    const video = videoRef.current;
-    if (!video) return;
-    video.currentTime = currentTime;
-    video.play();
-    setIsPlaying(true);
+    if (streamMode !== 'playback' || !playbackStartTime || !onSeek) return;
+    
+    // Calculate the new playback start time based on slider position
+    // The slider represents seconds from the original playback start time
+    const originalStartTime = new Date(playbackStartTime);
+    const newStartTime = new Date(originalStartTime.getTime() + sliderValue * 1000);
+    
+    // Call parent to restart stream with new time
+    onSeek(newStartTime.toISOString());
   };
 
   // Handle play/pause events from video element
@@ -278,22 +321,6 @@ export function VideoPlayer({
     return () => window.removeEventListener("resize", handleResize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawBoundingBoxes]);
-
-  // Freeze frame and detect objects
-  const handleFreezeAndDetect = async () => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    // Pause video
-    video.pause();
-    setIsFrozen(true);
-
-    // Pause HLS loading to prevent buffering in background
-    onPauseStream?.();
-
-    // Pass video element to parent for frame capture
-    onFrameFreeze(videoRef.current);
-  };
 
   return (
     <div className="flex flex-col h-full">
@@ -382,70 +409,64 @@ export function VideoPlayer({
 
       {/* Controls */}
       <div className="flex flex-col gap-3 mt-4 px-2">
-        {/* Progress Bar */}
+        {/* Progress Bar with Play/Pause */}
         <div className="flex items-center gap-3">
-          <span className="text-xs text-muted-foreground w-12 text-right font-mono">
-            {formatTime(currentTime)}
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={togglePlayPause}
+            disabled={!streamUrl}
+            className="h-8 w-8 shrink-0"
+          >
+            {isPlaying ? (
+              <Pause className="h-4 w-4" />
+            ) : (
+              <Play className="h-4 w-4" />
+            )}
+          </Button>
+          
+          <span className="text-xs text-muted-foreground w-16 text-right font-mono">
+            {streamMode === 'playback' && playbackStartTime 
+              ? formatTimestamp(new Date(new Date(playbackStartTime).getTime() + sliderValue * 1000))
+              : formatTime(0)}
           </span>
           <div className="flex-1 relative" ref={progressRef}>
             <input
               type="range"
-              min={seekableStart}
-              max={seekableEnd || duration || 0}
-              step={0.1}
-              value={currentTime}
+              min={0}
+              max={getSliderMax()}
+              step={1}
+              value={streamMode === 'playback' ? sliderValue : 0}
               onChange={handleSeek}
               onMouseDown={handleSeekStart}
               onMouseUp={handleSeekEnd}
               onTouchStart={handleSeekStart}
               onTouchEnd={handleSeekEnd}
-              disabled={!streamUrl}
+              disabled={!streamUrl || streamMode === 'live'}
               className="w-full h-1.5 bg-secondary rounded-lg appearance-none cursor-pointer accent-primary hover:accent-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
               style={{
-                background: `linear-gradient(to right, hsl(var(--primary)) 0%, hsl(var(--primary)) ${((currentTime - seekableStart) / ((seekableEnd || duration || 1) - seekableStart)) * 100}%, hsl(var(--secondary)) ${((currentTime - seekableStart) / ((seekableEnd || duration || 1) - seekableStart)) * 100}%, hsl(var(--secondary)) 100%)`
+                background: streamMode === 'playback' 
+                  ? `linear-gradient(to right, hsl(var(--primary)) 0%, hsl(var(--primary)) ${(sliderValue / ONE_DAY_SECONDS) * 100}%, hsl(var(--secondary)) ${(sliderValue / ONE_DAY_SECONDS) * 100}%, hsl(var(--secondary)) 100%)`
+                  : 'hsl(var(--secondary))'
               }}
             />
           </div>
-          <span className="text-xs text-muted-foreground w-12 font-mono">
-            {streamMode === 'live' ? 'LIVE' : formatTime(seekableEnd || duration)}
+          <span className="text-xs text-muted-foreground w-16 font-mono">
+            {streamMode === 'playback' && playbackStartTime
+              ? formatTimestamp(new Date(new Date(playbackStartTime).getTime() + ONE_DAY_SECONDS * 1000))
+              : 'LIVE'}
           </span>
         </div>
 
-        {/* Buttons */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={togglePlayPause}
-              disabled={!streamUrl || isFrozen}
-              className="h-9 w-9"
-            >
-              {isPlaying ? (
-                <Pause className="h-4 w-4" />
-              ) : (
-                <Play className="h-4 w-4" />
-              )}
-            </Button>
-
-            <Button
-              variant="default"
-              size="sm"
-              onClick={handleFreezeAndDetect}
-              disabled={isLoading || isFrozen}
-            >
-              <Scan className="h-4 w-4 mr-2" />
-              Freeze &amp; Detect
-            </Button>
-          </div>
-
-          {detectedObjects.length > 0 && (
+        {/* Detected Objects Count */}
+        {detectedObjects.length > 0 && (
+          <div className="flex items-center justify-end">
             <span className="text-sm text-muted-foreground">
               {detectedObjects.length} object
               {detectedObjects.length !== 1 ? "s" : ""} detected
             </span>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

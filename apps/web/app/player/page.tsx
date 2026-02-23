@@ -139,10 +139,6 @@ export default function PlayerPage() {
 
       // Poll for stream readiness before starting playback
       pollStreamReady(fullUrl);
-
-      toast.success(`${streamMode === "live" ? "Live" : "Playback"} stream starting...`, {
-        description: `Channel ${CHANNEL} - Waiting for stream...`,
-      });
     } catch (error) {
       console.error("Failed to start stream:", error);
       toast.error("Failed to start stream");
@@ -171,6 +167,8 @@ export default function PlayerPage() {
       setIsWaitingForStream(false);
       setStreamUrl(null);
       setStreamStartTimestamp(null);
+      // Clear detected objects when stream stops
+      setDetectedObjects([]);
     } catch (error) {
       console.error("Failed to stop stream:", error);
     }
@@ -206,9 +204,6 @@ export default function PlayerPage() {
         if (data.ready) {
           setIsWaitingForStream(false);
           setupHlsPlayer(url);
-          toast.success(`${streamMode === "live" ? "Live" : "Playback"} stream ready!`, {
-            description: `Channel ${CHANNEL}`,
-          });
           return;
         }
 
@@ -425,10 +420,6 @@ export default function PlayerPage() {
 
         const data: FrameObjectsResponse = await response.json();
         setDetectedObjects(data.objects);
-
-        toast.success(`Detected ${data.total_objects} objects in frame`, {
-          description: `Channel ${data.channel}`,
-        });
       } catch (error) {
         console.error("Failed to detect objects:", error);
         toast.error("Failed to detect objects", {
@@ -447,6 +438,25 @@ export default function PlayerPage() {
   const handleObjectHover = useCallback((objectId: number | null) => {
     setHighlightedObjectId(objectId);
   }, []);
+
+  // Handle seek in playback mode - restart stream with new start time
+  const handleSeek = useCallback(async (newStartTime: string) => {
+    if (streamMode !== 'playback') return;
+    
+    console.log(`[Seek] Restarting stream from ${newStartTime}`);
+    
+    // Stop current stream
+    await stopStream();
+    
+    // Update playback start time
+    setPlaybackStartTime(newStartTime);
+    
+    // Small delay to ensure stream is stopped before starting new one
+    setTimeout(() => {
+      startStream();
+    }, 100);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamMode]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -471,14 +481,13 @@ export default function PlayerPage() {
       </header>
 
       {/* Main Content */}
-      <main className="p-6">
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-[calc(100vh-140px)]">
+      <main className="p-6 h-[calc(100vh-73px)]">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-full">
           {/* Video Player Area */}
-          <div className="lg:col-span-3">
+          <div className="lg:col-span-3 h-full overflow-hidden">
             <VideoPlayer
               streamUrl={streamUrl}
               channel={CHANNEL}
-              onFrameFreeze={handleFrameFreeze}
               highlightedObjectId={highlightedObjectId}
               detectedObjects={detectedObjects}
               isLoading={isLoading}
@@ -488,11 +497,14 @@ export default function PlayerPage() {
               streamMode={streamMode}
               onPauseStream={pauseStreamLoading}
               onResumeStream={resumeStreamLoading}
+              playbackStartTime={playbackStartTime}
+              onSeek={handleSeek}
+              onClearDetectedObjects={() => setDetectedObjects([])}
             />
           </div>
 
           {/* Controls and Object List Sidebar */}
-          <div className="lg:col-span-1 space-y-4">
+          <div className="lg:col-span-1 h-full overflow-y-auto space-y-4">
             <StreamControls
               mode={streamMode}
               onModeChange={setStreamMode}
@@ -502,6 +514,13 @@ export default function PlayerPage() {
               onStartStream={startStream}
               onStopStream={stopStream}
               isLoading={isStreamLoading}
+              onFreezeAndDetect={() => {
+                if (videoRef.current) {
+                  videoRef.current.pause();
+                  pauseStreamLoading();
+                  handleFrameFreeze(videoRef.current);
+                }
+              }}
             />
 
             <ObjectList

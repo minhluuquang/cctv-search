@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Calendar, Clock, Play, Square } from "lucide-react";
+import { Calendar, Clock, Play, Square, Scan } from "lucide-react";
 import { formatDateTimeToISO } from "@/lib/utils";
 
 type StreamMode = "live" | "playback";
@@ -19,6 +19,7 @@ interface StreamControlsProps {
   onStartStream: () => void;
   onStopStream: () => void;
   isLoading: boolean;
+  onFreezeAndDetect?: () => void;
 }
 
 export function StreamControls({
@@ -30,6 +31,7 @@ export function StreamControls({
   onStartStream,
   onStopStream,
   isLoading,
+  onFreezeAndDetect,
 }: StreamControlsProps) {
   // Initialize with current date/time
   const now = new Date();
@@ -59,6 +61,49 @@ export function StreamControls({
           <TabsTrigger value="playback">Playback</TabsTrigger>
         </TabsList>
       </Tabs>
+
+      <div className="flex gap-2">
+        {!isStreamActive ? (
+          <Button
+            onClick={onStartStream}
+            disabled={isLoading}
+            className="flex-1"
+          >
+            {isLoading ? (
+              <>
+                <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                Starting...
+              </>
+            ) : (
+              <>
+                <Play className="mr-2 h-4 w-4" />
+                Start Stream
+              </>
+            )}
+          </Button>
+        ) : (
+          <Button
+            onClick={onStopStream}
+            variant="destructive"
+            className="flex-1"
+          >
+            <Square className="mr-2 h-4 w-4" />
+            Stop Stream
+          </Button>
+        )}
+      </div>
+
+      {/* Freeze & Detect Button */}
+      <Button
+        variant="default"
+        size="sm"
+        onClick={onFreezeAndDetect}
+        disabled={!isStreamActive || isLoading}
+        className="w-full"
+      >
+        <Scan className="h-4 w-4 mr-2" />
+        Freeze &amp; Detect
+      </Button>
 
       {mode === "playback" && (
         <div className="space-y-3 p-4 border rounded-lg bg-card/50">
@@ -97,37 +142,6 @@ export function StreamControls({
           </div>
         </div>
       )}
-
-      <div className="flex gap-2">
-        {!isStreamActive ? (
-          <Button
-            onClick={onStartStream}
-            disabled={isLoading}
-            className="flex-1"
-          >
-            {isLoading ? (
-              <>
-                <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                Starting...
-              </>
-            ) : (
-              <>
-                <Play className="mr-2 h-4 w-4" />
-                Start Stream
-              </>
-            )}
-          </Button>
-        ) : (
-          <Button
-            onClick={onStopStream}
-            variant="destructive"
-            className="flex-1"
-          >
-            <Square className="mr-2 h-4 w-4" />
-            Stop Stream
-          </Button>
-        )}
-      </div>
     </div>
   );
 }
