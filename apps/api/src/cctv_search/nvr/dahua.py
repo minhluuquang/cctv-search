@@ -60,7 +60,9 @@ class DahuaNVRClient:
 
     def _format_timestamp(self, dt: datetime) -> str:
         """Format datetime for Dahua RTSP endpoint (YYYY_MM_DD_HH_MM_SS)."""
-        return dt.strftime("%Y_%m_%d_%H_%M_%S")
+        formatted = dt.strftime("%Y_%m_%d_%H_%M_%S")
+        print(f"[DEBUG] _format_timestamp: {dt} -> {formatted}")
+        return formatted
 
     def _build_rtsp_url(
         self, channel: int, start_time: datetime, end_time: datetime
@@ -117,9 +119,14 @@ class DahuaNVRClient:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # DEBUG: Log timestamp details
+        print(f"[DEBUG] extract_frame received timestamp: {timestamp}")
+        print(f"[DEBUG] timestamp.isoformat(): {timestamp.isoformat()}")
+        print(f"[DEBUG] timestamp.tzinfo: {timestamp.tzinfo}")
+
         # Build RTSP URL with 1-second window around the timestamp
         start_time = timestamp
-        end_time = timestamp.replace(second=timestamp.second + 1)
+        end_time = timestamp + timedelta(seconds=1)
         rtsp_url = self._build_rtsp_url(channel, start_time, end_time)
 
         # Extract frame using ffmpeg
@@ -285,8 +292,21 @@ class DahuaNVRClient:
         if playlist_path.exists():
             playlist_path.unlink()
 
+        # Calculate base timestamp for HLS (epoch seconds since 1970-01-01)
+        # For playback mode, use the requested start_time
+        # For live mode, use current time
+        if start_time:
+            # Convert datetime to epoch seconds
+            hls_base_time = start_time.timestamp()
+            print(f"[HLS] Playback mode - base time: {start_time.isoformat()} "
+                  f"({hls_base_time})")
+        else:
+            hls_base_time = 0  # Live mode - use relative time
+            print("[HLS] Live mode - using relative time")
+
         # FFmpeg command to transcode RTSP to HLS
         # Optimized for FAST START (low latency over stability)
+        # Includes program date time for accurate timestamp tracking
         cmd = [
             "ffmpeg",
             "-rtsp_transport", self.rtsp_transport,
@@ -312,7 +332,8 @@ class DahuaNVRClient:
             "-hls_time", "2",  # 2 second segments (faster start than 4)
             "-hls_list_size", "6",  # Keep 6 segments (12 seconds)
             # CRITICAL: append_list writes playlist after EACH segment
-            "-hls_flags", "independent_segments+delete_segments+append_list",
+            "-hls_flags",
+            "independent_segments+delete_segments+append_list",
             "-hls_segment_type", "mpegts",
             "-hls_segment_filename", str(output_dir / "segment_%03d.ts"),
             "-start_number", "0",
@@ -382,4 +403,42 @@ class DahuaNVRClient:
                 "Check NVR connection and credentials."
             )
 
+        # Create timestamp mapping file for accurate frame extraction
+        # This maps segment indices to actual video timestamps
+        if start_time:
+            timestamp_file = output_dir / "timestamps.json"
+            self._create_timestamp_mapping(timestamp_file, start_time)
+            print(f"[HLS] Created timestamp mapping: {timestamp_file}")
+
         return process, str(playlist_path)
+
+    def _create_timestamp_mapping(
+        self,
+        timestamp_file: Path,
+        start_time: datetime,
+    ) -> None:
+        """Create timestamp mapping file for accurate frame extraction.
+
+        This creates a JSON file that maps segment indices to actual video
+        timestamps, allowing the UI to get accurate timestamps without
+        relying on HLS PROGRAM-DATE-TIME which uses wallclock time.
+
+        Args:
+            timestamp_file: Path to the timestamp mapping file
+            start_time: The actual start time of the playback
+        """
+        import json
+
+        mapping = {
+            "start_time": start_time.isoformat(),
+            "segment_duration": 2.0,
+            "segments": {},
+        }
+
+        # Pre-populate first 10 segments
+        for i in range(10):
+            segment_time = start_time + timedelta(seconds=i * 2.0)
+            mapping["segments"][f"segment_{i:03d}.ts"] = segment_time.isoformat()
+
+        timestamp_file.write_text(json.dumps(mapping, indent=2))
+        print(f"[HLS] Timestamp mapping: {start_time.isoformat()}")

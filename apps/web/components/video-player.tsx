@@ -2,7 +2,7 @@
 
 import { useRef, useState, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Pause, Play, Scan } from "lucide-react";
+import { Scan } from "lucide-react";
 
 interface BoundingBox {
   x: number;
@@ -30,6 +30,8 @@ interface VideoPlayerProps {
   isStreamLoading?: boolean;
   isWaitingForStream?: boolean;
   streamMode?: "live" | "playback";
+  onPauseStream?: () => void;
+  onResumeStream?: () => void;
 }
 
 export function VideoPlayer({
@@ -43,14 +45,17 @@ export function VideoPlayer({
   isStreamLoading = false,
   isWaitingForStream = false,
   streamMode = "live",
+  onPauseStream,
+  onResumeStream,
 }: VideoPlayerProps) {
   const internalVideoRef = useRef<HTMLVideoElement>(null);
   const videoRef = externalVideoRef || internalVideoRef;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [isPlaying, setIsPlaying] = useState(true);
   const [isFrozen, setIsFrozen] = useState(false);
-  const [videoSize, setVideoSize] = useState({ width: 1920, height: 1080 });
+  // Fixed detection resolution - NVR streams and detects at 1920x1080
+  const DETECTION_WIDTH = 1920;
+  const DETECTION_HEIGHT = 1080;
 
   // Draw bounding boxes on canvas
   const drawBoundingBoxes = useCallback(() => {
@@ -66,9 +71,34 @@ export function VideoPlayer({
 
     if (detectedObjects.length === 0) return;
 
-    // Calculate scale factors
-    const scaleX = canvas.width / videoSize.width;
-    const scaleY = canvas.height / videoSize.height;
+    // Get container dimensions
+    const containerRect = containerRef.current?.getBoundingClientRect();
+    
+    if (!containerRect) return;
+    
+    // Calculate where the video is actually displayed within the container
+    // When using object-fit: contain, there might be letterboxing
+    const videoAspect = DETECTION_WIDTH / DETECTION_HEIGHT;
+    const containerAspect = containerRect.width / containerRect.height;
+    
+    let displayWidth = containerRect.width;
+    let displayHeight = containerRect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+    
+    if (containerAspect > videoAspect) {
+      // Container is wider - black bars on left/right
+      displayWidth = containerRect.height * videoAspect;
+      offsetX = (containerRect.width - displayWidth) / 2;
+    } else {
+      // Container is taller - black bars on top/bottom
+      displayHeight = containerRect.width / videoAspect;
+      offsetY = (containerRect.height - displayHeight) / 2;
+    }
+    
+    // Calculate scale factors based on actual video display area
+    const scaleX = displayWidth / DETECTION_WIDTH;
+    const scaleY = displayHeight / DETECTION_HEIGHT;
 
     detectedObjects.forEach((obj) => {
       const isHighlighted = obj.object_id === highlightedObjectId;
@@ -85,9 +115,9 @@ export function VideoPlayer({
         ctx.fillStyle = "rgba(34, 197, 94, 0.1)";
       }
 
-      // Draw bounding box
-      const scaledX = x * scaleX;
-      const scaledY = y * scaleY;
+      // Draw bounding box with offset for letterboxing
+      const scaledX = x * scaleX + offsetX;
+      const scaledY = y * scaleY + offsetY;
       const scaledW = width * scaleX;
       const scaledH = height * scaleY;
 
@@ -118,7 +148,7 @@ export function VideoPlayer({
       ctx.fillText(text, scaledX + padding, scaledY - padding - 2);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detectedObjects, highlightedObjectId, videoSize]);
+  }, [detectedObjects, highlightedObjectId]);
 
   // Update canvas when objects or highlight changes
   useEffect(() => {
@@ -127,13 +157,8 @@ export function VideoPlayer({
 
   // Handle video metadata loaded
   const handleLoadedMetadata = () => {
-    const video = videoRef.current;
-    if (video) {
-      setVideoSize({
-        width: video.videoWidth || 1920,
-        height: video.videoHeight || 1080,
-      });
-    }
+    // Video metadata loaded - detection resolution is fixed at 1920x1080
+    console.log(`[Video] Metadata loaded: ${videoRef.current?.videoWidth}x${videoRef.current?.videoHeight}`);
   };
 
   // Handle resize
@@ -153,21 +178,6 @@ export function VideoPlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawBoundingBoxes]);
 
-  // Toggle play/pause
-  const togglePlayPause = () => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (isPlaying) {
-      video.pause();
-      setIsPlaying(false);
-    } else {
-      video.play();
-      setIsPlaying(true);
-      setIsFrozen(false);
-    }
-  };
-
   // Freeze frame and detect objects
   const handleFreezeAndDetect = async () => {
     const video = videoRef.current;
@@ -175,8 +185,10 @@ export function VideoPlayer({
 
     // Pause video
     video.pause();
-    setIsPlaying(false);
     setIsFrozen(true);
+
+    // Pause HLS loading to prevent buffering in background
+    onPauseStream?.();
 
     // Pass video element to parent for frame capture
     onFrameFreeze(videoRef.current);
@@ -268,31 +280,15 @@ export function VideoPlayer({
 
       {/* Controls */}
       <div className="flex items-center justify-between mt-4 px-2">
-        <div className="flex items-center gap-3">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={togglePlayPause}
-            disabled={isLoading}
-          >
-            {isPlaying ? (
-              <Pause className="h-4 w-4 mr-2" />
-            ) : (
-              <Play className="h-4 w-4 mr-2" />
-            )}
-            {isPlaying ? "Pause" : "Play"}
-          </Button>
-
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleFreezeAndDetect}
-            disabled={isLoading || isFrozen}
-          >
-            <Scan className="h-4 w-4 mr-2" />
-            Freeze &amp; Detect
-          </Button>
-        </div>
+        <Button
+          variant="default"
+          size="sm"
+          onClick={handleFreezeAndDetect}
+          disabled={isLoading || isFrozen}
+        >
+          <Scan className="h-4 w-4 mr-2" />
+          Freeze &amp; Detect
+        </Button>
 
         {detectedObjects.length > 0 && (
           <span className="text-sm text-muted-foreground">

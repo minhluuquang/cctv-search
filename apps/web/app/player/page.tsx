@@ -8,6 +8,7 @@ import { StreamControls, type StreamMode } from "@/components/stream-controls";
 import { Button } from "@/components/ui/button";
 import { Camera, Settings } from "lucide-react";
 import { toast } from "sonner";
+import { formatDateToLocalISO } from "@/lib/utils";
 
 // API Configuration
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -39,6 +40,8 @@ export default function PlayerPage() {
   const [isWaitingForStream, setIsWaitingForStream] = useState(false);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [isStreamStarted, setIsStreamStarted] = useState(false);
+  const [streamStartTimestamp, setStreamStartTimestamp] = useState<Date | null>(null);
+  const [videoStartTime, setVideoStartTime] = useState<number>(0); // video.currentTime when stream started
   
   // Stream mode and playback controls
   const [streamMode, setStreamMode] = useState<StreamMode>("live");
@@ -50,6 +53,49 @@ export default function PlayerPage() {
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const accumulatedSeekTime = useRef<number>(0); // Track total seek offset
+  const timestampMappingRef = useRef<{start_time: string, segment_duration: number, segments: Record<string, string>} | null>(null); // API timestamp mapping
+  
+  // Helper function to get actual timestamp from API mapping or fallback to calculation
+  const getFrameTimestamp = useCallback((videoElement: HTMLVideoElement): Date => {
+    // Get the actual playback time accounting for HLS buffer delay
+    // currentTime is the stream position, but buffered.end(0) is what's actually playing
+    let actualTime = videoElement.currentTime;
+    
+    if (videoElement.buffered.length > 0) {
+      const bufferedEnd = videoElement.buffered.end(0);
+      // Use the earlier of currentTime or buffered end to avoid being ahead
+      actualTime = Math.min(actualTime, bufferedEnd);
+      console.log(`[Timestamp] Video currentTime: ${videoElement.currentTime}s, buffered: ${bufferedEnd}s, using: ${actualTime}s`);
+    }
+    
+    // Try to get timestamp from API mapping first
+    if (timestampMappingRef.current) {
+      const mapping = timestampMappingRef.current;
+      const segmentDuration = mapping.segment_duration;
+      const segmentIndex = Math.floor(actualTime / segmentDuration);
+      const segmentFile = `segment_${String(segmentIndex).padStart(3, '0')}.ts`;
+      
+      if (mapping.segments[segmentFile]) {
+        const segmentTime = new Date(mapping.segments[segmentFile]);
+        const offsetInSegment = (actualTime % segmentDuration) * 1000;
+        const result = new Date(segmentTime.getTime() + offsetInSegment);
+        console.log(`[Timestamp] Using API mapping: ${result.toISOString()} (segment: ${segmentFile})`);
+        return result;
+      }
+    }
+    
+    // Fallback to calculation
+    if (streamMode === "live" || !streamStartTimestamp) {
+      return new Date();
+    } else {
+      const videoElapsedTime = actualTime - videoStartTime;
+      const totalElapsedTime = videoElapsedTime + accumulatedSeekTime.current;
+      const result = new Date(streamStartTimestamp.getTime() + (totalElapsedTime * 1000));
+      console.log(`[Timestamp] Using calculated time: ${result.toISOString()}`);
+      return result;
+    }
+  }, [streamMode, streamStartTimestamp, videoStartTime]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -91,6 +137,14 @@ export default function PlayerPage() {
       setStreamUrl(fullUrl);
       setIsStreamStarted(true);
 
+      // Track the actual stream start timestamp
+      if (streamMode === "live") {
+        setStreamStartTimestamp(new Date());
+      } else {
+        // For playback, use the selected start time
+        setStreamStartTimestamp(new Date(playbackStartTime));
+      }
+
       // Poll for stream readiness before starting playback
       pollStreamReady(fullUrl);
 
@@ -118,6 +172,7 @@ export default function PlayerPage() {
       setIsStreamStarted(false);
       setIsWaitingForStream(false);
       setStreamUrl(null);
+      setStreamStartTimestamp(null);
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -126,6 +181,22 @@ export default function PlayerPage() {
       console.error("Failed to stop stream:", error);
     }
   };
+
+  // Pause HLS stream loading (for Freeze & Detect)
+  const pauseStreamLoading = useCallback(() => {
+    if (hlsRef.current) {
+      hlsRef.current.stopLoad();
+      console.log("[HLS] Stream loading paused");
+    }
+  }, []);
+
+  // Resume HLS stream loading
+  const resumeStreamLoading = useCallback(() => {
+    if (hlsRef.current) {
+      hlsRef.current.startLoad();
+      console.log("[HLS] Stream loading resumed");
+    }
+  }, []);
 
   // Poll for stream readiness
   const pollStreamReady = async (url: string) => {
@@ -225,6 +296,33 @@ export default function PlayerPage() {
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.play().catch(console.error);
+        
+        // Track video start time for accurate timestamp calculation
+        setVideoStartTime(video.currentTime);
+        accumulatedSeekTime.current = 0;
+        
+        // Fetch timestamp mapping from API for accurate timestamps
+        if (streamMode === "playback") {
+          fetch(`${API_BASE_URL}/stream/${CHANNEL}/timestamps`)
+            .then(res => res.json())
+            .then(data => {
+              timestampMappingRef.current = data;
+              console.log("[Timestamp] Loaded mapping from API:", data.start_time);
+            })
+            .catch(err => {
+              console.warn("[Timestamp] Failed to load mapping:", err);
+              timestampMappingRef.current = null;
+            });
+        }
+        
+        // Track seeking events to calculate accurate timestamp
+        let lastSeekTime = video.currentTime;
+        video.addEventListener('seeked', () => {
+          const seekOffset = video.currentTime - lastSeekTime;
+          accumulatedSeekTime.current += seekOffset;
+          lastSeekTime = video.currentTime;
+          console.log(`[Video] Seeked: offset=${seekOffset.toFixed(2)}s, total=${accumulatedSeekTime.current.toFixed(2)}s`);
+        });
       });
 
       hls.on(Hls.Events.ERROR, (event, data) => {
@@ -280,10 +378,35 @@ export default function PlayerPage() {
     }
   };
 
+  // Store the exact timestamp when video was frozen
+  const frozenTimestampRef = useRef<string | null>(null);
+
   // Capture frame from video and detect objects
   const handleFrameFreeze = useCallback(
     async (videoElement: HTMLVideoElement | null) => {
       if (!videoElement) return;
+
+      // Video is already paused by VideoPlayer before calling this
+      // Capture timestamp immediately (video time is frozen)
+      const frameTime = getFrameTimestamp(videoElement);
+      const frameTimestamp = formatDateToLocalISO(frameTime);
+      
+      console.log("[Freeze & Detect] Timestamp captured:");
+      console.log("  Video currentTime:", videoElement.currentTime);
+      console.log("  Frame timestamp:", frameTimestamp);
+      console.log("  Timestamp mapping loaded:", timestampMappingRef.current ? "YES" : "NO");
+      
+      if (timestampMappingRef.current) {
+        const mapping = timestampMappingRef.current;
+        const segmentDuration = mapping.segment_duration;
+        const segmentIndex = Math.floor(videoElement.currentTime / segmentDuration);
+        const segmentFile = `segment_${String(segmentIndex).padStart(3, '0')}.ts`;
+        console.log("  Segment:", segmentFile);
+        console.log("  Segment start:", mapping.segments[segmentFile]);
+      }
+      
+      // Store the timestamp for reference
+      frozenTimestampRef.current = frameTimestamp;
 
       setIsLoading(true);
       setDetectedObjects([]);
@@ -305,18 +428,29 @@ export default function PlayerPage() {
         // Store frame URL for thumbnails (local use only)
         const frameUrl = canvas.toDataURL("image/jpeg", 0.95);
         setCapturedFrameUrl(frameUrl);
-
-        // Call API - backend gets frame from NVR using timestamp
-        const frameTime = new Date();
+        
+        console.log("[Freeze & Detect] Using timestamp:", frameTimestamp);
+        console.log("[Freeze & Detect] Sending frame image (multipart/form-data) to API");
+        
+        // Convert canvas to blob for multipart upload
+        const frameBlob = await new Promise<Blob | null>((resolve) => {
+          canvas.toBlob(resolve, "image/jpeg", 0.95);
+        });
+        
+        if (!frameBlob) {
+          throw new Error("Failed to convert canvas to blob");
+        }
+        
+        // Create multipart form data
+        const formData = new FormData();
+        formData.append("timestamp", frameTimestamp);
+        formData.append("channel", CHANNEL.toString());
+        formData.append("frame_image", frameBlob, "frame.jpg");
+        
         const response = await fetch(`${API_BASE_URL}/frames/objects`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            timestamp: frameTime.toISOString(),
-            channel: CHANNEL,
-          }),
+          body: formData,
+          // Don't set Content-Type header - browser will set it with boundary
         });
 
         if (!response.ok) {
@@ -343,7 +477,7 @@ export default function PlayerPage() {
         setIsLoading(false);
       }
     },
-    [CHANNEL]
+    [CHANNEL, getFrameTimestamp]
   );
 
   // Handle object hover
@@ -389,6 +523,8 @@ export default function PlayerPage() {
               isStreamLoading={isStreamLoading}
               isWaitingForStream={isWaitingForStream}
               streamMode={streamMode}
+              onPauseStream={pauseStreamLoading}
+              onResumeStream={resumeStreamLoading}
             />
           </div>
 

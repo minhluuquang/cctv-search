@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,10 +34,9 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# Global state
+# Global state - connection managers (thread-safe)
 nvr_client: DahuaNVRClient | None = None
-detector: RFDetrDetector | None = None
-tracker: FeatureTracker | None = None
+detector: RFDetrDetector | None = None  # Singleton - expensive to recreate
 
 # HLS streams directory
 HLS_DIR = Path("/tmp/hls")
@@ -98,10 +97,9 @@ stream_manager: StreamManager | None = None
 async def lifespan(app: FastAPI):
     """Manage application lifespan."""
     # Startup
-    global nvr_client, detector, tracker, stream_manager
+    global nvr_client, detector, stream_manager
     nvr_client = DahuaNVRClient()
     detector = RFDetrDetector()
-    tracker = FeatureTracker()
     stream_manager = StreamManager()
     # Load RF-DETR model on startup (optional - may fail if not installed)
     try:
@@ -188,10 +186,19 @@ class DetectedObjectResponse(BaseModel):
 
 
 class FrameObjectsRequest(BaseModel):
-    """Request to extract a frame and detect/track objects."""
+    """Request to extract a frame and detect/track objects.
 
-    timestamp: datetime
+    Can provide either:
+    - timestamp: Extract frame from NVR at specified time
+    - frame_image: Base64-encoded image to use directly (more accurate)
+
+    Note: timestamp is a string in format YYYY-MM-DDTHH:MM:SS to preserve
+    local time without timezone conversion issues.
+    """
+
+    timestamp: str  # Format: "YYYY-MM-DDTHH:MM:SS" - local time, no timezone
     channel: int = 1
+    frame_image: str | None = None  # Base64-encoded image (optional)
 
 
 class DetectedObjectWithId(BaseModel):
@@ -433,9 +440,10 @@ def annotate_video_clip(
         target_track_id = None
         logger.info(f"Annotating video: {total_frames} frames to process")
 
-        # Reset tracker for fresh tracking session
-        tracker.reset()
-        logger.info("Tracker reset for video annotation")
+        # Create local tracker for this request (no global state)
+        from cctv_search.ai import FeatureTracker
+        local_tracker = FeatureTracker()
+        logger.info("Local tracker created for video annotation")
 
         while True:
             ret, frame = cap.read()
@@ -449,8 +457,8 @@ def annotate_video_clip(
             # Detect objects
             detections = detector.detect(frame_bytes)
 
-            # Update tracker
-            tracks = tracker.update(detections, frame_idx)
+            # Update local tracker
+            tracks = local_tracker.update(detections, frame_idx)
 
             # Find target track on first frame using bbox matching
             if frame_idx == 0 and tracks:
@@ -562,18 +570,24 @@ def annotate_video_clip(
 
 @app.post("/frames/objects", response_model=FrameObjectsResponse)
 async def get_frame_with_objects(
-    request: FrameObjectsRequest,
+    timestamp: str = Form(..., description="Timestamp in format YYYY-MM-DDTHH:MM:SS"),
+    channel: int = Form(1, description="Camera channel number"),
+    frame_image: UploadFile | None = File(
+        None, description="Frame image file (optional)"
+    ),
 ) -> FrameObjectsResponse:
-    """Extract frame at timestamp from NVR and detect objects.
+    """Extract frame and detect objects.
 
     Flow:
-    1. Extract frame from NVR at specified timestamp and channel
+    1. Use provided frame image (multipart) OR extract from NVR at timestamp
     2. Run detection using detector.detect(frame_bytes)
     3. Run tracking using tracker.update(detections, frame_idx=0) to get track IDs
     4. Return detected objects with bounding boxes
 
     Args:
-        request: Frame extraction and object detection request with timestamp and channel.
+        timestamp: Timestamp string in format "YYYY-MM-DDTHH:MM:SS"
+        channel: Camera channel number (default: 1)
+        frame_image: Optional uploaded frame image file (more accurate than NVR)
 
     Returns:
         FrameObjectsResponse with detected objects.
@@ -581,40 +595,54 @@ async def get_frame_with_objects(
     Raises:
         HTTPException: If NVR client is not initialized or frame extraction fails.
     """
-    global tracker
-
-    if not nvr_client:
-        raise HTTPException(
-            status_code=500, detail="NVR client not initialized")
-
     # Check if detector is available
     if not detector:
         raise HTTPException(status_code=500, detail="Detector not initialized")
 
     try:
-        # Step 1: Extract frame from NVR
-        frame_path = nvr_client.extract_frame(
-            timestamp=request.timestamp,
-            channel=request.channel,
-            output_path=f"/tmp/frame_{request.timestamp.isoformat()}.png",
-        )
+        # Parse timestamp string to datetime
+        from datetime import datetime
+        timestamp_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+
+        # DEBUG: Log received timestamp details
+        logger.info(f"[DEBUG] Received timestamp string: {timestamp}")
+        logger.info(f"[DEBUG] Parsed timestamp: {timestamp_dt}")
 
         objects_with_id: list[DetectedObjectWithId] = []
+        frame_bytes: bytes
 
-        # Real detection flow
-        # Step 2: Read frame bytes
-        with open(frame_path, "rb") as f:
-            frame_bytes = f.read()
+        # Step 1: Get frame bytes - either from provided image or extract from NVR
+        if frame_image:
+            # Use provided uploaded image (more accurate)
+            logger.info(f"[DEBUG] Using provided frame image: {frame_image.filename}")
+            frame_bytes = await frame_image.read()
+            logger.info(f"[DEBUG] Read frame image: {len(frame_bytes)} bytes")
+        else:
+            # Fall back to extracting frame from NVR (less accurate)
+            logger.info("[DEBUG] No frame image provided, extracting from NVR")
+            if not nvr_client:
+                raise HTTPException(
+                    status_code=500, detail="NVR client not initialized and no frame image provided")
 
-        # Step 3: Run detection
+            frame_path = nvr_client.extract_frame(
+                timestamp=timestamp_dt,
+                channel=channel,
+                output_path=f"/tmp/frame_{timestamp.replace(':', '-')}.png",
+            )
+            with open(frame_path, "rb") as f:
+                frame_bytes = f.read()
+
+        # Step 2: Run detection
         detections: list[DetectedObject] = detector.detect(frame_bytes)
 
         # Set frame timestamp
         for det in detections:
-            det.frame_timestamp = request.timestamp.timestamp()
+            det.frame_timestamp = timestamp_dt.timestamp()
 
-        # Step 4: Run tracking
-        tracks = tracker.update(detections, frame_idx=0)
+        # Step 3: Create fresh tracker for each request to avoid ID accumulation
+        from cctv_search.ai import FeatureTracker
+        fresh_tracker = FeatureTracker()
+        tracks = fresh_tracker.update(detections, frame_idx=0)
 
         # Convert tracks to DetectedObjectWithId
         for track in tracks:
@@ -633,8 +661,8 @@ async def get_frame_with_objects(
             objects_with_id.append(obj_with_id)
 
         return FrameObjectsResponse(
-            timestamp=request.timestamp,
-            channel=request.channel,
+            timestamp=timestamp_dt,
+            channel=channel,
             objects=objects_with_id,
             total_objects=len(objects_with_id),
         )
@@ -979,17 +1007,17 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
         # Real implementation using NVR and search algorithm
         logger.info("Running real object search with NVR")
 
-        # Check if detector and tracker are available
+        # Check if detector is available
         if not detector:
             raise HTTPException(
                 status_code=500, detail="Detector not initialized"
             )
-        if not tracker:
-            raise HTTPException(
-                status_code=500, detail="Tracker not initialized"
-            )
 
         try:
+            # Create local tracker for this search request
+            from cctv_search.ai import FeatureTracker
+            local_tracker = FeatureTracker()
+
             # Create video decoder adapter
             video_decoder = NVRVideoDecoder(
                 nvr_client=nvr_client,
@@ -1004,9 +1032,9 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
                 detector=detector, fps=20.0
             )
 
-            # Create search tracker wrapper using FeatureTracker's matching
+            # Create search tracker wrapper using local FeatureTracker
             search_tracker = SearchObjectTracker(
-                tracker=tracker,
+                tracker=local_tracker,
                 target_bbox=request.object_bbox,
                 target_label=request.object_label,
             )
@@ -1255,7 +1283,7 @@ async def check_stream_ready(channel: int) -> dict:
         Dictionary with ready status and playlist URL if ready.
     """
     playlist_path = HLS_DIR / f"ch{channel}" / "playlist.m3u8"
-    
+
     if playlist_path.exists():
         # Check if file has content
         size = playlist_path.stat().st_size
@@ -1265,7 +1293,7 @@ async def check_stream_ready(channel: int) -> dict:
                 "playlist_url": f"/hls/ch{channel}/playlist.m3u8",
                 "channel": channel,
             }
-    
+
     return {
         "ready": False,
         "playlist_url": None,
@@ -1291,7 +1319,7 @@ async def get_nvr_status() -> dict:
                 "has_password": False,
             }
         }
-    
+
     return {
         "connected": True,
         "config": {
@@ -1302,3 +1330,36 @@ async def get_nvr_status() -> dict:
         },
         "message": "NVR client configured" if nvr_client.host else "NVR not configured - set NVR_HOST env var"
     }
+
+
+@app.get("/stream/{channel}/timestamps")
+async def get_hls_timestamps(channel: int) -> dict:
+    """Get timestamp mapping for HLS stream segments.
+
+    Returns a mapping of segment filenames to actual video timestamps,
+    allowing the UI to extract accurate timestamps from the HLS stream.
+
+    Args:
+        channel: Camera channel number.
+
+    Returns:
+        Dictionary with start_time, segment_duration, and segment mappings.
+    """
+    timestamp_file = HLS_DIR / f"ch{channel}" / "timestamps.json"
+
+    if not timestamp_file.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Timestamp mapping not found for channel {channel}. "
+                   "Stream may not be started or is in live mode."
+        )
+
+    try:
+        import json
+        content = timestamp_file.read_text()
+        return json.loads(content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read timestamp mapping: {e}"
+        ) from e

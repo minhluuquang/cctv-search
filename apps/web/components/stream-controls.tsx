@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Calendar, Clock, Play, Square } from "lucide-react";
+import { formatDateTimeToISO } from "@/lib/utils";
 
 type StreamMode = "live" | "playback";
 
@@ -18,24 +19,6 @@ interface StreamControlsProps {
   onStartStream: () => void;
   onStopStream: () => void;
   isLoading: boolean;
-}
-
-// Format date and time to ISO string without timezone conversion
-function formatDateTimeToISO(dateStr: string, timeStr: string): string {
-  // Combine date and time, treat as local time
-  const dateTimeStr = `${dateStr}T${timeStr}`;
-  const date = new Date(dateTimeStr);
-  
-  // Create ISO string but preserve the local time
-  // by manually constructing it without timezone offset
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  const seconds = String(date.getSeconds()).padStart(2, '0');
-  
-  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
 }
 
 export function StreamControls({
