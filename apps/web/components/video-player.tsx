@@ -2,7 +2,15 @@
 
 import { useRef, useState, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Scan } from "lucide-react";
+import { Scan, Play, Pause } from "lucide-react";
+
+// Helper function to format seconds to MM:SS
+function formatTime(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return "00:00";
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+}
 
 interface BoundingBox {
   x: number;
@@ -53,6 +61,13 @@ export function VideoPlayer({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [isFrozen, setIsFrozen] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [seekableStart, setSeekableStart] = useState(0);
+  const [seekableEnd, setSeekableEnd] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const progressRef = useRef<HTMLDivElement>(null);
   // Fixed detection resolution - NVR streams and detects at 1920x1080
   const DETECTION_WIDTH = 1920;
   const DETECTION_HEIGHT = 1080;
@@ -157,9 +172,95 @@ export function VideoPlayer({
 
   // Handle video metadata loaded
   const handleLoadedMetadata = () => {
+    const video = videoRef.current;
+    if (!video) return;
     // Video metadata loaded - detection resolution is fixed at 1920x1080
-    console.log(`[Video] Metadata loaded: ${videoRef.current?.videoWidth}x${videoRef.current?.videoHeight}`);
+    console.log(`[Video] Metadata loaded: ${video.videoWidth}x${video.videoHeight}`);
+    setDuration(video.duration || 0);
+    updateSeekableRange();
   };
+
+  // Update seekable range for live streams
+  const updateSeekableRange = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    
+    if (video.seekable.length > 0) {
+      setSeekableStart(video.seekable.start(0));
+      setSeekableEnd(video.seekable.end(0));
+    }
+  };
+
+  // Handle time update
+  const handleTimeUpdate = () => {
+    if (isDragging) return;
+    const video = videoRef.current;
+    if (!video) return;
+    setCurrentTime(video.currentTime);
+    updateSeekableRange();
+  };
+
+  // Handle play/pause toggle
+  const togglePlayPause = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    
+    if (video.paused) {
+      video.play();
+      setIsPlaying(true);
+      onResumeStream?.();
+    } else {
+      video.pause();
+      setIsPlaying(false);
+      onPauseStream?.();
+    }
+  };
+
+  // Handle seeking via slider
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const video = videoRef.current;
+    if (!video) return;
+    
+    const seekTime = parseFloat(e.target.value);
+    setCurrentTime(seekTime);
+  };
+
+  // Handle seek start (mouse down on slider)
+  const handleSeekStart = () => {
+    setIsDragging(true);
+    const video = videoRef.current;
+    if (video && !video.paused) {
+      video.pause();
+    }
+  };
+
+  // Handle seek end (mouse up on slider)
+  const handleSeekEnd = () => {
+    setIsDragging(false);
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = currentTime;
+    video.play();
+    setIsPlaying(true);
+  };
+
+  // Handle play/pause events from video element
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const handlePlay = () => setIsPlaying(true);
+    const handlePause = () => setIsPlaying(false);
+
+    video.addEventListener('play', handlePlay);
+    video.addEventListener('pause', handlePause);
+
+    return () => {
+      video.removeEventListener('play', handlePlay);
+      video.removeEventListener('pause', handlePause);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Handle resize
   useEffect(() => {
@@ -209,6 +310,7 @@ export function VideoPlayer({
           playsInline
           className="w-full h-full object-contain"
           onLoadedMetadata={handleLoadedMetadata}
+          onTimeUpdate={handleTimeUpdate}
           crossOrigin="anonymous"
         />
         <canvas
@@ -279,23 +381,71 @@ export function VideoPlayer({
       </div>
 
       {/* Controls */}
-      <div className="flex items-center justify-between mt-4 px-2">
-        <Button
-          variant="default"
-          size="sm"
-          onClick={handleFreezeAndDetect}
-          disabled={isLoading || isFrozen}
-        >
-          <Scan className="h-4 w-4 mr-2" />
-          Freeze &amp; Detect
-        </Button>
-
-        {detectedObjects.length > 0 && (
-          <span className="text-sm text-muted-foreground">
-            {detectedObjects.length} object
-            {detectedObjects.length !== 1 ? "s" : ""} detected
+      <div className="flex flex-col gap-3 mt-4 px-2">
+        {/* Progress Bar */}
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-muted-foreground w-12 text-right font-mono">
+            {formatTime(currentTime)}
           </span>
-        )}
+          <div className="flex-1 relative" ref={progressRef}>
+            <input
+              type="range"
+              min={seekableStart}
+              max={seekableEnd || duration || 0}
+              step={0.1}
+              value={currentTime}
+              onChange={handleSeek}
+              onMouseDown={handleSeekStart}
+              onMouseUp={handleSeekEnd}
+              onTouchStart={handleSeekStart}
+              onTouchEnd={handleSeekEnd}
+              disabled={!streamUrl}
+              className="w-full h-1.5 bg-secondary rounded-lg appearance-none cursor-pointer accent-primary hover:accent-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{
+                background: `linear-gradient(to right, hsl(var(--primary)) 0%, hsl(var(--primary)) ${((currentTime - seekableStart) / ((seekableEnd || duration || 1) - seekableStart)) * 100}%, hsl(var(--secondary)) ${((currentTime - seekableStart) / ((seekableEnd || duration || 1) - seekableStart)) * 100}%, hsl(var(--secondary)) 100%)`
+              }}
+            />
+          </div>
+          <span className="text-xs text-muted-foreground w-12 font-mono">
+            {streamMode === 'live' ? 'LIVE' : formatTime(seekableEnd || duration)}
+          </span>
+        </div>
+
+        {/* Buttons */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={togglePlayPause}
+              disabled={!streamUrl || isFrozen}
+              className="h-9 w-9"
+            >
+              {isPlaying ? (
+                <Pause className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+            </Button>
+
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleFreezeAndDetect}
+              disabled={isLoading || isFrozen}
+            >
+              <Scan className="h-4 w-4 mr-2" />
+              Freeze &amp; Detect
+            </Button>
+          </div>
+
+          {detectedObjects.length > 0 && (
+            <span className="text-sm text-muted-foreground">
+              {detectedObjects.length} object
+              {detectedObjects.length !== 1 ? "s" : ""} detected
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -4,22 +4,20 @@ from __future__ import annotations
 
 import io
 import logging
-import os
-import random
-import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from cctv_search.ai import BoundingBox, DetectedObject, FeatureTracker, RFDetrDetector
+from cctv_search.ai import DetectedObject, FeatureTracker, RFDetrDetector
 from cctv_search.nvr import DahuaNVRClient
 from cctv_search.search.algorithm import BackwardTemporalSearch, ObjectDetection
 from cctv_search.search.algorithm import BoundingBox as SearchBBox
+from cctv_search.streaming import http_stream_manager
 
 logger = logging.getLogger(__name__)
 
@@ -38,69 +36,20 @@ logger.setLevel(logging.INFO)
 nvr_client: DahuaNVRClient | None = None
 detector: RFDetrDetector | None = None  # Singleton - expensive to recreate
 
-# HLS streams directory
-HLS_DIR = Path("/tmp/hls")
-HLS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-class StreamManager:
-    """Manages active HLS streams."""
-
-    def __init__(self):
-        self.active_streams: dict[int, subprocess.Popen] = {}
-        self.hls_dir = HLS_DIR
-
-    def start_stream(self, channel: int, start_time: datetime | None = None) -> str:
-        """Start HLS stream for a channel.
-        
-        Args:
-            channel: Camera channel number
-            start_time: If provided, start playback from this time (playback mode)
-                       If None, stream live (live mode)
-        """
-        # Stop existing stream if any
-        self.stop_stream(channel)
-
-        # Start new stream
-        process, playlist_path = nvr_client.start_hls_stream(
-            channel=channel,
-            output_dir=self.hls_dir,
-            start_time=start_time,
-        )
-        self.active_streams[channel] = process
-
-        # Return relative URL path
-        return f"/hls/ch{channel}/playlist.m3u8"
-
-    def stop_stream(self, channel: int) -> None:
-        """Stop HLS stream for a channel."""
-        if channel in self.active_streams:
-            process = self.active_streams[channel]
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            del self.active_streams[channel]
-
-    def cleanup(self) -> None:
-        """Stop all streams."""
-        for channel in list(self.active_streams.keys()):
-            self.stop_stream(channel)
-
-
-# Global stream manager
-stream_manager: StreamManager | None = None
+# Clips directory (for video clip downloads)
+CLIPS_DIR = Path("./clips")
+CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan."""
     # Startup
-    global nvr_client, detector, stream_manager
+    global nvr_client, detector
     nvr_client = DahuaNVRClient()
     detector = RFDetrDetector()
-    stream_manager = StreamManager()
+    # Start HTTP stream manager
+    await http_stream_manager.start()
     # Load RF-DETR model on startup (optional - may fail if not installed)
     try:
         detector.load_model()
@@ -109,8 +58,7 @@ async def lifespan(app: FastAPI):
         detector = None
     yield
     # Shutdown
-    if stream_manager:
-        stream_manager.cleanup()
+    await http_stream_manager.stop()
     # No disconnect needed for Dahua client
 
 
@@ -130,8 +78,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount HLS streams directory
-app.mount("/hls", StaticFiles(directory=str(HLS_DIR)), name="hls")
+# Mount clips directory for downloads
+app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 
 
 # Pydantic models for streaming
@@ -1202,24 +1150,23 @@ async def start_stream(request: StreamStartRequest) -> StreamStartResponse:
         StreamStartResponse with HLS playlist URL.
 
     Raises:
-        HTTPException: If stream manager not initialized.
+        HTTPException: If NVR client not initialized.
     """
-    if not stream_manager:
-        raise HTTPException(
-            status_code=500, detail="Stream manager not initialized")
-
     if not nvr_client:
         raise HTTPException(
             status_code=500, detail="NVR client not initialized")
 
     try:
-        playlist_url = stream_manager.start_stream(
-            request.channel, request.start_time
+        # Start HTTP-based stream
+        await http_stream_manager.start_stream(
+            channel=request.channel,
+            nvr_client=nvr_client,
+            start_time=request.start_time,
         )
 
         mode = "playback" if request.start_time else "live"
         return StreamStartResponse(
-            playlist_url=playlist_url,
+            playlist_url=f"/hls/{request.channel}/playlist.m3u8",
             channel=request.channel,
             message=f"HLS {mode} stream started for channel {request.channel}",
         )
@@ -1238,16 +1185,9 @@ async def stop_stream(request: StreamStopRequest) -> dict:
 
     Returns:
         Success message.
-
-    Raises:
-        HTTPException: If stream manager not initialized.
     """
-    if not stream_manager:
-        raise HTTPException(
-            status_code=500, detail="Stream manager not initialized")
-
     try:
-        stream_manager.stop_stream(request.channel)
+        await http_stream_manager.stop_stream(request.channel)
         return {
             "message": f"Stream stopped for channel {request.channel}",
             "channel": request.channel,
@@ -1265,10 +1205,7 @@ async def get_stream_status() -> dict:
     Returns:
         Dictionary with active channel list.
     """
-    if not stream_manager:
-        return {"active_channels": []}
-
-    active_channels = list(stream_manager.active_streams.keys())
+    active_channels = list(http_stream_manager.streams.keys())
     return {
         "active_channels": active_channels,
         "count": len(active_channels),
@@ -1282,23 +1219,56 @@ async def check_stream_ready(channel: int) -> dict:
     Returns:
         Dictionary with ready status and playlist URL if ready.
     """
-    playlist_path = HLS_DIR / f"ch{channel}" / "playlist.m3u8"
+    stream = http_stream_manager.get_stream(channel)
 
-    if playlist_path.exists():
-        # Check if file has content
-        size = playlist_path.stat().st_size
-        if size > 0:
-            return {
-                "ready": True,
-                "playlist_url": f"/hls/ch{channel}/playlist.m3u8",
-                "channel": channel,
-            }
+    if stream and stream.is_running and len(stream.segments) > 0:
+        return {
+            "ready": True,
+            "playlist_url": f"/hls/{channel}/playlist.m3u8",
+            "channel": channel,
+            "segments_available": len(stream.segments),
+        }
 
     return {
         "ready": False,
         "playlist_url": None,
         "channel": channel,
     }
+
+
+@app.get("/hls/{channel}/playlist.m3u8")
+async def get_hls_playlist(channel: int) -> Response:
+    """Get HLS playlist for a channel.
+
+    Args:
+        channel: Camera channel number.
+
+    Returns:
+        HLS playlist content.
+    """
+    playlist = await http_stream_manager.get_playlist(channel)
+    return Response(
+        content=playlist,
+        media_type="application/vnd.apple.mpegurl",
+    )
+
+
+@app.get("/hls/{channel}/segment_{segment_index}.ts")
+async def get_hls_segment(channel: int, segment_index: int) -> Response:
+    """Get HLS segment for a channel.
+
+    Args:
+        channel: Camera channel number.
+        segment_index: Segment index.
+
+    Returns:
+        MPEG-TS segment data.
+    """
+    data = await http_stream_manager.get_segment(channel, segment_index)
+    return Response(
+        content=data,
+        media_type="video/mp2t",
+    )
 
 
 @app.get("/nvr/status")
@@ -1345,9 +1315,9 @@ async def get_hls_timestamps(channel: int) -> dict:
     Returns:
         Dictionary with start_time, segment_duration, and segment mappings.
     """
-    timestamp_file = HLS_DIR / f"ch{channel}" / "timestamps.json"
+    stream = http_stream_manager.get_stream(channel)
 
-    if not timestamp_file.exists():
+    if not stream or not stream.start_time:
         raise HTTPException(
             status_code=404,
             detail=f"Timestamp mapping not found for channel {channel}. "
@@ -1355,9 +1325,17 @@ async def get_hls_timestamps(channel: int) -> dict:
         )
 
     try:
-        import json
-        content = timestamp_file.read_text()
-        return json.loads(content)
+        mapping = {
+            "start_time": stream.start_time.isoformat(),
+            "segment_duration": 2.0,
+            "segments": {},
+        }
+
+        for seg in stream.segments:
+            if seg.timestamp:
+                mapping["segments"][f"segment_{seg.index:03d}.ts"] = seg.timestamp.isoformat()
+
+        return mapping
     except Exception as e:
         raise HTTPException(
             status_code=500,

@@ -41,50 +41,45 @@ export default function PlayerPage() {
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [isStreamStarted, setIsStreamStarted] = useState(false);
   const [streamStartTimestamp, setStreamStartTimestamp] = useState<Date | null>(null);
-  const [videoStartTime, setVideoStartTime] = useState<number>(0); // video.currentTime when stream started
-  
+  const [videoStartTime, setVideoStartTime] = useState<number>(0);
+
   // Stream mode and playback controls
   const [streamMode, setStreamMode] = useState<StreamMode>("live");
   const [playbackStartTime, setPlaybackStartTime] = useState(() => {
     const now = new Date();
-    now.setMinutes(now.getMinutes() - 5); // Default to 5 minutes ago
+    now.setMinutes(now.getMinutes() - 5);
     return now.toISOString();
   });
-  
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const accumulatedSeekTime = useRef<number>(0); // Track total seek offset
-  const timestampMappingRef = useRef<{start_time: string, segment_duration: number, segments: Record<string, string>} | null>(null); // API timestamp mapping
-  
+  const accumulatedSeekTime = useRef<number>(0);
+  const timestampMappingRef = useRef<{ start_time: string; segment_duration: number; segments: Record<string, string> } | null>(null);
+
   // Helper function to get actual timestamp from API mapping or fallback to calculation
   const getFrameTimestamp = useCallback((videoElement: HTMLVideoElement): Date => {
-    // Get the actual playback time accounting for HLS buffer delay
-    // currentTime is the stream position, but buffered.end(0) is what's actually playing
     let actualTime = videoElement.currentTime;
-    
+
     if (videoElement.buffered.length > 0) {
       const bufferedEnd = videoElement.buffered.end(0);
-      // Use the earlier of currentTime or buffered end to avoid being ahead
       actualTime = Math.min(actualTime, bufferedEnd);
-      console.log(`[Timestamp] Video currentTime: ${videoElement.currentTime}s, buffered: ${bufferedEnd}s, using: ${actualTime}s`);
     }
-    
+
     // Try to get timestamp from API mapping first
     if (timestampMappingRef.current) {
       const mapping = timestampMappingRef.current;
       const segmentDuration = mapping.segment_duration;
       const segmentIndex = Math.floor(actualTime / segmentDuration);
       const segmentFile = `segment_${String(segmentIndex).padStart(3, '0')}.ts`;
-      
+
       if (mapping.segments[segmentFile]) {
         const segmentTime = new Date(mapping.segments[segmentFile]);
         const offsetInSegment = (actualTime % segmentDuration) * 1000;
         const result = new Date(segmentTime.getTime() + offsetInSegment);
-        console.log(`[Timestamp] Using API mapping: ${result.toISOString()} (segment: ${segmentFile})`);
         return result;
       }
     }
-    
+
     // Fallback to calculation
     if (streamMode === "live" || !streamStartTimestamp) {
       return new Date();
@@ -92,7 +87,6 @@ export default function PlayerPage() {
       const videoElapsedTime = actualTime - videoStartTime;
       const totalElapsedTime = videoElapsedTime + accumulatedSeekTime.current;
       const result = new Date(streamStartTimestamp.getTime() + (totalElapsedTime * 1000));
-      console.log(`[Timestamp] Using calculated time: ${result.toISOString()}`);
       return result;
     }
   }, [streamMode, streamStartTimestamp, videoStartTime]);
@@ -114,12 +108,11 @@ export default function PlayerPage() {
       const requestBody: { channel: number; start_time?: string } = {
         channel: CHANNEL,
       };
-      
-      // Add start time for playback mode
+
       if (streamMode === "playback" && playbackStartTime) {
         requestBody.start_time = playbackStartTime;
       }
-      
+
       const response = await fetch(`${API_BASE_URL}/stream/start`, {
         method: "POST",
         headers: {
@@ -141,7 +134,6 @@ export default function PlayerPage() {
       if (streamMode === "live") {
         setStreamStartTimestamp(new Date());
       } else {
-        // For playback, use the selected start time
         setStreamStartTimestamp(new Date(playbackStartTime));
       }
 
@@ -162,6 +154,11 @@ export default function PlayerPage() {
   // Stop HLS stream
   const stopStream = async () => {
     try {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+
       await fetch(`${API_BASE_URL}/stream/stop`, {
         method: "POST",
         headers: {
@@ -169,14 +166,11 @@ export default function PlayerPage() {
         },
         body: JSON.stringify({ channel: CHANNEL }),
       });
+
       setIsStreamStarted(false);
       setIsWaitingForStream(false);
       setStreamUrl(null);
       setStreamStartTimestamp(null);
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
     } catch (error) {
       console.error("Failed to stop stream:", error);
     }
@@ -201,7 +195,7 @@ export default function PlayerPage() {
   // Poll for stream readiness
   const pollStreamReady = async (url: string) => {
     setIsWaitingForStream(true);
-    const maxAttempts = 30; // 30 seconds max
+    const maxAttempts = 30;
     let attempts = 0;
 
     const checkReady = async () => {
@@ -250,13 +244,12 @@ export default function PlayerPage() {
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: false, // Disable for stability
-        backBufferLength: 120, // Increase buffer
-        maxBufferLength: 60, // Increase max buffer
+        lowLatencyMode: false,
+        backBufferLength: 120,
+        maxBufferLength: 60,
         maxMaxBufferLength: 120,
-        liveSyncDurationCount: 3, // Sync to live edge with 3 segments buffer
-        liveMaxLatencyDurationCount: 5, // Max latency before seeking
-        // Better error recovery
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 5,
         fragLoadPolicy: {
           default: {
             maxTimeToFirstByteMs: 10000,
@@ -296,11 +289,10 @@ export default function PlayerPage() {
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.play().catch(console.error);
-        
-        // Track video start time for accurate timestamp calculation
+
         setVideoStartTime(video.currentTime);
         accumulatedSeekTime.current = 0;
-        
+
         // Fetch timestamp mapping from API for accurate timestamps
         if (streamMode === "playback") {
           fetch(`${API_BASE_URL}/stream/${CHANNEL}/timestamps`)
@@ -311,11 +303,10 @@ export default function PlayerPage() {
             })
             .catch(err => {
               console.warn("[Timestamp] Failed to load mapping:", err);
-              timestampMappingRef.current = null;
             });
         }
-        
-        // Track seeking events to calculate accurate timestamp
+
+        // Track seeking events
         let lastSeekTime = video.currentTime;
         video.addEventListener('seeked', () => {
           const seekOffset = video.currentTime - lastSeekTime;
@@ -339,7 +330,6 @@ export default function PlayerPage() {
             default:
               console.error("Fatal HLS error, restarting stream...");
               hls.destroy();
-              // Auto-restart stream after fatal error
               setTimeout(() => {
                 if (isStreamStarted) {
                   startStream();
@@ -354,8 +344,7 @@ export default function PlayerPage() {
       let lastTime = video.currentTime;
       const checkStall = setInterval(() => {
         if (video.paused || video.ended) return;
-        
-        // If video hasn't progressed in 5 seconds, it's stalled
+
         if (video.currentTime === lastTime) {
           console.log("Video stalled, attempting recovery...");
           hls.recoverMediaError();
@@ -386,33 +375,15 @@ export default function PlayerPage() {
     async (videoElement: HTMLVideoElement | null) => {
       if (!videoElement) return;
 
-      // Video is already paused by VideoPlayer before calling this
-      // Capture timestamp immediately (video time is frozen)
       const frameTime = getFrameTimestamp(videoElement);
       const frameTimestamp = formatDateToLocalISO(frameTime);
-      
-      console.log("[Freeze & Detect] Timestamp captured:");
-      console.log("  Video currentTime:", videoElement.currentTime);
-      console.log("  Frame timestamp:", frameTimestamp);
-      console.log("  Timestamp mapping loaded:", timestampMappingRef.current ? "YES" : "NO");
-      
-      if (timestampMappingRef.current) {
-        const mapping = timestampMappingRef.current;
-        const segmentDuration = mapping.segment_duration;
-        const segmentIndex = Math.floor(videoElement.currentTime / segmentDuration);
-        const segmentFile = `segment_${String(segmentIndex).padStart(3, '0')}.ts`;
-        console.log("  Segment:", segmentFile);
-        console.log("  Segment start:", mapping.segments[segmentFile]);
-      }
-      
-      // Store the timestamp for reference
+
       frozenTimestampRef.current = frameTimestamp;
 
       setIsLoading(true);
       setDetectedObjects([]);
 
       try {
-        // Create canvas to capture frame for local thumbnails
         const canvas = document.createElement("canvas");
         canvas.width = videoElement.videoWidth || 1920;
         canvas.height = videoElement.videoHeight || 1080;
@@ -422,35 +393,27 @@ export default function PlayerPage() {
           throw new Error("Failed to get canvas context");
         }
 
-        // Draw current video frame to canvas
         ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
 
-        // Store frame URL for thumbnails (local use only)
         const frameUrl = canvas.toDataURL("image/jpeg", 0.95);
         setCapturedFrameUrl(frameUrl);
-        
-        console.log("[Freeze & Detect] Using timestamp:", frameTimestamp);
-        console.log("[Freeze & Detect] Sending frame image (multipart/form-data) to API");
-        
-        // Convert canvas to blob for multipart upload
+
         const frameBlob = await new Promise<Blob | null>((resolve) => {
           canvas.toBlob(resolve, "image/jpeg", 0.95);
         });
-        
+
         if (!frameBlob) {
           throw new Error("Failed to convert canvas to blob");
         }
-        
-        // Create multipart form data
+
         const formData = new FormData();
         formData.append("timestamp", frameTimestamp);
         formData.append("channel", CHANNEL.toString());
         formData.append("frame_image", frameBlob, "frame.jpg");
-        
+
         const response = await fetch(`${API_BASE_URL}/frames/objects`, {
           method: "POST",
           body: formData,
-          // Don't set Content-Type header - browser will set it with boundary
         });
 
         if (!response.ok) {
