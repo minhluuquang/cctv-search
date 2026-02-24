@@ -75,12 +75,12 @@ export function ObjectList({
 
   if (isLoading) {
     return (
-      <Card className="h-full border-border/50">
-        <CardHeader className="pb-3">
+      <Card className="flex-1 min-h-0 border-border/50 flex flex-col">
+        <CardHeader className="pb-3 flex-shrink-0">
           <CardTitle className="text-sm font-medium">Detected Objects</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="flex flex-col items-center justify-center py-8 gap-3">
+        <CardContent className="flex-1 flex flex-col items-center justify-center">
+          <div className="flex flex-col items-center justify-center gap-3">
             <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin" />
             <span className="text-sm text-muted-foreground">Analyzing frame...</span>
           </div>
@@ -91,12 +91,12 @@ export function ObjectList({
 
   if (objects.length === 0) {
     return (
-      <Card className="h-full border-border/50">
-        <CardHeader className="pb-3">
+      <Card className="flex-1 min-h-0 border-border/50 flex flex-col">
+        <CardHeader className="pb-3 flex-shrink-0">
           <CardTitle className="text-sm font-medium">Detected Objects</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="flex flex-col items-center justify-center py-8 text-center">
+        <CardContent className="flex-1 flex flex-col items-center justify-center">
+          <div className="flex flex-col items-center justify-center text-center">
             <p className="text-sm text-muted-foreground">
               No objects detected
             </p>
@@ -110,8 +110,8 @@ export function ObjectList({
   }
 
   return (
-    <Card className="h-full border-border/50">
-      <CardHeader className="pb-3">
+    <Card className="flex-1 min-h-0 border-border/50 flex flex-col">
+      <CardHeader className="pb-3 flex-shrink-0">
         <div className="flex items-center justify-between">
           <CardTitle className="text-sm font-medium">Detected Objects</CardTitle>
           <Badge variant="secondary" className="text-xs">
@@ -119,8 +119,8 @@ export function ObjectList({
           </Badge>
         </div>
       </CardHeader>
-      <CardContent className="p-0">
-        <div className="h-[calc(100vh-280px)] overflow-y-auto">
+      <CardContent className="p-0 flex-1 min-h-0 overflow-hidden">
+        <div className="h-full overflow-y-auto">
           <div className="space-y-2 p-4 pt-0">
             {objects.map((obj) => {
               const Icon = getObjectIcon(obj.label);

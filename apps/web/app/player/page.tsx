@@ -504,7 +504,7 @@ export default function PlayerPage() {
           </div>
 
           {/* Controls and Object List Sidebar */}
-          <div className="lg:col-span-1 h-full overflow-y-auto space-y-4">
+          <div className="lg:col-span-1 h-full overflow-hidden flex flex-col space-y-4">
             <StreamControls
               mode={streamMode}
               onModeChange={setStreamMode}
