@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import { DetectionWorkspace } from "@/components/detection";
 
 export default function Home() {
-  redirect("/player");
+  return <DetectionWorkspace />;
 }
