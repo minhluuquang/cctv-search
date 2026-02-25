@@ -198,10 +198,10 @@ class ObjectSearchRequest(BaseModel):
     object_id: int  # Track ID from frame detection
     # How far back to search (default 1 hour)
     search_duration_seconds: int = 3600
-    # Object details for matching (from frame detection)
-    object_label: str  # e.g., "person", "bicycle"
-    object_bbox: dict[str, float]  # {x, y, width, height}
-    object_confidence: float
+    # Object details for matching (extracted from frame by API)
+    object_label: str | None = None  # e.g., "person", "bicycle"
+    object_bbox: dict[str, float] | None = None  # {x, y, width, height}
+    object_confidence: float | None = None
 
 
 class ObjectSearchResult(BaseModel):
@@ -216,7 +216,6 @@ class ObjectSearchResult(BaseModel):
     track_duration_seconds: float | None
     clip_path: str | None  # Path to generated video clip (if found)
     image_path: str | None  # Path to annotated frame image at first appearance
-    play_command: str | None  # Full ffplay command to view the 15s clip
 
 
 class ObjectSearchResponse(BaseModel):
@@ -912,17 +911,37 @@ class SearchObjectTracker:
 
 
 @app.post("/search/object", response_model=ObjectSearchResponse)
-async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
+async def search_object(
+    timestamp: str = Form(..., description="Timestamp in format YYYY-MM-DDTHH:MM:SS"),
+    channel: int = Form(1, description="Camera channel number"),
+    bbox_x: float = Form(..., description="Object bounding box X coordinate"),
+    bbox_y: float = Form(..., description="Object bounding box Y coordinate"),
+    bbox_width: float = Form(..., description="Object bounding box width"),
+    bbox_height: float = Form(..., description="Object bounding box height"),
+    object_label: str = Form(..., description="Object label (e.g., 'person', 'bicycle')"),
+    object_confidence: float = Form(..., description="Object detection confidence"),
+    search_duration_seconds: int = Form(3600, description="How far back to search in seconds (max 10800)"),
+) -> ObjectSearchResponse:
     """Search backward in time to find when object first appeared.
 
-    Implements backward coarse-to-fine search:
-    1. Start from given timestamp (object is visible here)
-    2. Search backward using coarse sampling (30 sec steps)
-    3. Refine with medium sampling (5 sec steps)
-    4. Pinpoint with frame-level binary search
+    Flow:
+    1. Receive object details from frontend (already detected)
+    2. Search backward using coarse-to-fine temporal search:
+       - Start from given timestamp (object is visible here)
+       - Search backward using coarse sampling (30 sec steps)
+       - Refine with medium sampling (5 sec steps)
+       - Pinpoint with frame-level binary search
 
     Args:
-        request: Object search request with object ID and search parameters
+        timestamp: Timestamp string in format "YYYY-MM-DDTHH:MM:SS"
+        channel: Camera channel number (default: 1)
+        bbox_x: Object bounding box X coordinate (top-left)
+        bbox_y: Object bounding box Y coordinate (top-left)
+        bbox_width: Object bounding box width
+        bbox_height: Object bounding box height
+        object_label: Object class label from detection
+        object_confidence: Detection confidence score
+        search_duration_seconds: How far back to search (default: 3600, max: 10800)
 
     Returns:
         ObjectSearchResponse with search results
@@ -935,197 +954,191 @@ async def search_object(request: ObjectSearchRequest) -> ObjectSearchResponse:
             status_code=500, detail="NVR client not initialized")
 
     # Validate request
-    if request.search_duration_seconds <= 0:
+    if search_duration_seconds <= 0:
         raise HTTPException(
             status_code=400, detail="Search duration must be greater than 0"
         )
 
-    if request.search_duration_seconds > 10800:  # 3 hours max
+    if search_duration_seconds > 10800:  # 3 hours max
         raise HTTPException(
             status_code=400, detail="Maximum search duration is 3 hours (10800 seconds)"
         )
 
+    try:
+        # Parse timestamp string to datetime
+        from datetime import datetime
+        start_timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid timestamp format. Use YYYY-MM-DDTHH:MM:SS: {e}"
+        ) from e
+
+    # Build target bbox from form parameters
+    target_bbox_input = {
+        "x": bbox_x,
+        "y": bbox_y,
+        "width": bbox_width,
+        "height": bbox_height,
+    }
+
     logger.info(
-        f"Starting object search: object_id={request.object_id}, "
-        f"label={request.object_label}, from={request.start_timestamp}, "
-        f"searching_back={request.search_duration_seconds}s"
+        f"Starting object search using bbox coordinates: "
+        f"x={bbox_x}, y={bbox_y}, w={bbox_width}, h={bbox_height}, "
+        f"channel={channel}, from={start_timestamp}, "
+        f"searching_back={search_duration_seconds}s"
     )
 
     try:
-        # Real implementation using NVR and search algorithm
-        logger.info("Running real object search with NVR")
-
         # Check if detector is available
         if not detector:
             raise HTTPException(
                 status_code=500, detail="Detector not initialized"
             )
 
-        try:
-            # Create local tracker for this search request
-            from cctv_search.ai import FeatureTracker
-            local_tracker = FeatureTracker()
+        # Use object details directly from frontend (already detected via /frames/objects)
+        object_bbox = {
+            "x": bbox_x,
+            "y": bbox_y,
+            "width": bbox_width,
+            "height": bbox_height,
+        }
 
-            # Create video decoder adapter
-            video_decoder = NVRVideoDecoder(
-                nvr_client=nvr_client,
-                channel=int(request.camera_id)
-                if request.camera_id.isdigit()
-                else 1,
-                fps=20.0,
-            )
+        logger.info(
+            f"Starting object search for {object_label} at "
+            f"x={bbox_x:.1f}, y={bbox_y:.1f}, w={bbox_width:.1f}, h={bbox_height:.1f}"
+        )
 
-            # Create search detector wrapper
-            search_detector = SearchObjectDetector(
-                detector=detector, fps=20.0
-            )
+        # Create components for search
+        local_tracker = FeatureTracker()
 
-            # Create search tracker wrapper using local FeatureTracker
-            search_tracker = SearchObjectTracker(
-                tracker=local_tracker,
-                target_bbox=request.object_bbox,
-                target_label=request.object_label,
-            )
+        video_decoder = NVRVideoDecoder(
+            nvr_client=nvr_client,
+            channel=channel,
+            fps=20.0,
+        )
 
-            # Create backward search
-            search = BackwardTemporalSearch(
-                video_decoder=video_decoder,
-                detector=search_detector,
-                tracker=search_tracker,
-                fps=20.0,
-            )
+        search_detector = SearchObjectDetector(
+            detector=detector, fps=20.0
+        )
 
-            # Log search configuration
-            logger.info("\n" + "=" * 70)
-            logger.info("OBJECT SEARCH STARTED")
-            logger.info("=" * 70)
-            logger.info(f"Camera ID: {request.camera_id}")
-            logger.info(f"Start timestamp: {request.start_timestamp}")
-            logger.info(
-                f"Object: {request.object_label} (ID: {request.object_id})")
-            logger.info(f"Search duration: {request.search_duration_seconds}s")
-            logger.info(f"Bounding box: x={request.object_bbox['x']:.1f}, y={request.object_bbox['y']:.1f}, "
-                        f"w={request.object_bbox['width']:.1f}, h={request.object_bbox['height']:.1f}")
-            logger.info(f"Confidence: {request.object_confidence:.3f}")
-            logger.info("=" * 70)
+        search_tracker = SearchObjectTracker(
+            tracker=local_tracker,
+            target_bbox=object_bbox,
+            target_label=object_label,
+        )
 
-            # Create target detection from request using search algorithm
-            target_detection = ObjectDetection(
-                label=request.object_label,
-                bbox=SearchBBox(
-                    x=request.object_bbox["x"],
-                    y=request.object_bbox["y"],
-                    width=request.object_bbox["width"],
-                    height=request.object_bbox["height"],
-                    confidence=request.object_confidence,
-                ),
-                confidence=request.object_confidence,
-            )
+        search = BackwardTemporalSearch(
+            video_decoder=video_decoder,
+            detector=search_detector,
+            tracker=search_tracker,
+            fps=20.0,
+        )
 
-            # Run search
-            logger.info("\nStarting backward temporal search...")
-            search_result = search.search(
-                start_time=request.start_timestamp,
-                target_detection=target_detection,
-            )
+        # Log search configuration
+        logger.info("\n" + "=" * 70)
+        logger.info("OBJECT SEARCH STARTED")
+        logger.info("=" * 70)
+        logger.info(f"Camera ID: {channel}")
+        logger.info(f"Start timestamp: {start_timestamp}")
+        logger.info(f"Object: {object_label}")
+        logger.info(f"Search duration: {search_duration_seconds}s")
+        logger.info(f"Bounding box: x={object_bbox['x']:.1f}, y={object_bbox['y']:.1f}, "
+                    f"w={object_bbox['width']:.1f}, h={object_bbox['height']:.1f}")
+        logger.info(f"Confidence: {object_confidence:.3f}")
+        logger.info("=" * 70)
 
-            # Check for error status first
-            from cctv_search.search.algorithm import SearchStatus
+        # Create target detection for search algorithm
+        target_detection = ObjectDetection(
+            label=object_label,
+            bbox=SearchBBox(
+                x=object_bbox["x"],
+                y=object_bbox["y"],
+                width=object_bbox["width"],
+                height=object_bbox["height"],
+                confidence=object_confidence,
+            ),
+            confidence=object_confidence,
+        )
 
-            if search_result.status == SearchStatus.ERROR:
-                logger.error("\n" + "=" * 70)
-                logger.error("SEARCH RESULT: ERROR")
-                logger.error("=" * 70)
-                logger.error(f"Error: {search_result.message}")
-                logger.error("=" * 70)
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Search failed: {search_result.message}"
-                )
+        # Run search
+        logger.info("\nStarting backward temporal search...")
+        search_result = search.search(
+            start_time=start_timestamp,
+            target_detection=target_detection,
+        )
 
-            if search_result.found:
-                first_seen = datetime.fromtimestamp(
-                    search_result.timestamp or 0
-                )
-                track_duration = (
-                    request.start_timestamp - first_seen
-                ).total_seconds()
+        # Check for error status first
+        from cctv_search.search.algorithm import SearchStatus
 
-                # Skip clip and image generation - only search results returned
-                clip_path_str = None
-                image_path_str = None
-
-                # Build RTSP playback URL for 15 seconds before first appearance
-                playback_start = first_seen - timedelta(seconds=15)
-                playback_end = first_seen  # End at the found timestamp
-                channel = int(
-                    request.camera_id) if request.camera_id.isdigit() else 1
-                rtsp_url = nvr_client._build_rtsp_url_with_auth(
-                    channel=channel,
-                    start_time=playback_start,
-                    end_time=playback_end,
-                )
-                # Return full ffplay command (no quotes needed, URL is already encoded)
-                rtsp_url = f"ffplay -rtsp_transport tcp {rtsp_url}"
-
-                result = ObjectSearchResult(
-                    found=True,
-                    first_seen_timestamp=first_seen,
-                    last_seen_timestamp=request.start_timestamp,
-                    search_iterations=search_result.iterations,
-                    confidence=search_result.confidence,
-                    message=f"Object found after {search_result.iterations} "
-                    f"search iterations. Track duration: {track_duration:.1f}s",
-                    track_duration_seconds=track_duration,
-                    clip_path=clip_path_str,
-                    image_path=image_path_str,
-                    play_command=rtsp_url,
-                )
-
-                logger.info("\n" + "=" * 70)
-                logger.info("SEARCH RESULT: SUCCESS")
-                logger.info("=" * 70)
-                logger.info(f"First seen: {first_seen}")
-                logger.info(f"Track duration: {track_duration:.1f} seconds")
-                logger.info(f"Search iterations: {search_result.iterations}")
-                logger.info(f"Confidence: {search_result.confidence}")
-                logger.info("=" * 70)
-
-                return ObjectSearchResponse(status="success", result=result)
-            else:
-                result = ObjectSearchResult(
-                    found=False,
-                    first_seen_timestamp=None,
-                    last_seen_timestamp=None,
-                    search_iterations=search_result.iterations,
-                    confidence=None,
-                    message="Object not found in specified search window. "
-                    "It may have appeared earlier than the search range.",
-                    track_duration_seconds=None,
-                    clip_path=None,
-                    image_path=None,
-                    play_command=None,
-                )
-
-                logger.info("\n" + "=" * 70)
-                logger.info("SEARCH RESULT: NOT FOUND")
-                logger.info("=" * 70)
-                logger.info(f"Search iterations: {search_result.iterations}")
-                logger.info(
-                    "Reason: Object not found in specified search window")
-                logger.info(
-                    "Suggestion: The object may have appeared earlier than the search range")
-                logger.info("=" * 70)
-
-                return ObjectSearchResponse(
-                    status="not_found", result=result
-                )
-
-        except Exception as e:
-            logger.exception("Real object search failed")
+        if search_result.status == SearchStatus.ERROR:
+            logger.error("\n" + "=" * 70)
+            logger.error("SEARCH RESULT: ERROR")
+            logger.error("=" * 70)
+            logger.error(f"Error: {search_result.message}")
+            logger.error("=" * 70)
             raise HTTPException(
-                status_code=500, detail=f"Search failed: {e}"
-            ) from e
+                status_code=503,
+                detail=f"Search failed: {search_result.message}"
+            )
+
+        if search_result.found:
+            first_seen = datetime.fromtimestamp(
+                search_result.timestamp or 0
+            )
+            track_duration = (
+                start_timestamp - first_seen
+            ).total_seconds()
+
+            result = ObjectSearchResult(
+                found=True,
+                first_seen_timestamp=first_seen,
+                last_seen_timestamp=start_timestamp,
+                search_iterations=search_result.iterations,
+                confidence=search_result.confidence,
+                message=f"Object found after {search_result.iterations} "
+                f"search iterations. Track duration: {track_duration:.1f}s",
+                track_duration_seconds=track_duration,
+                clip_path=None,
+                image_path=None,
+            )
+
+            logger.info("\n" + "=" * 70)
+            logger.info("SEARCH RESULT: SUCCESS")
+            logger.info("=" * 70)
+            logger.info(f"First seen: {first_seen}")
+            logger.info(f"Track duration: {track_duration:.1f} seconds")
+            logger.info(f"Search iterations: {search_result.iterations}")
+            logger.info(f"Confidence: {search_result.confidence}")
+            logger.info("=" * 70)
+
+            return ObjectSearchResponse(status="success", result=result)
+        else:
+            result = ObjectSearchResult(
+                found=False,
+                first_seen_timestamp=None,
+                last_seen_timestamp=None,
+                search_iterations=search_result.iterations,
+                confidence=None,
+                message="Object not found in specified search window. "
+                "It may have appeared earlier than the search range.",
+                track_duration_seconds=None,
+                clip_path=None,
+                image_path=None,
+            )
+
+            logger.info("\n" + "=" * 70)
+            logger.info("SEARCH RESULT: NOT FOUND")
+            logger.info("=" * 70)
+            logger.info(f"Search iterations: {search_result.iterations}")
+            logger.info(
+                "Reason: Object not found in specified search window")
+            logger.info(
+                "Suggestion: The object may have appeared earlier than the search range")
+            logger.info("=" * 70)
+
+            return ObjectSearchResponse(
+                status="not_found", result=result
+            )
 
     except HTTPException:
         raise

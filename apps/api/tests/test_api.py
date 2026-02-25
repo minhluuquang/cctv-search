@@ -600,14 +600,16 @@ def test_search_object_nvr_not_initialized(client):
         timestamp = datetime(2026, 2, 19, 22, 31, 5)
         response = client.post(
             "/search/object",
-            json={
-                "camera_id": "1",
-                "start_timestamp": timestamp.isoformat(),
-                "object_id": 42,
-                "search_duration_seconds": 3600,
+            data={
+                "timestamp": timestamp.isoformat(),
+                "channel": "1",
+                "bbox_x": "100.0",
+                "bbox_y": "200.0",
+                "bbox_width": "50.0",
+                "bbox_height": "80.0",
                 "object_label": "person",
-                "object_bbox": {"x": 100.0, "y": 200.0, "width": 50.0, "height": 80.0},
-                "object_confidence": 0.95,
+                "object_confidence": "0.95",
+                "search_duration_seconds": "3600",
             },
         )
 
@@ -628,14 +630,16 @@ def test_search_object_invalid_duration(mock_nvr_client, client):
     timestamp = datetime(2026, 2, 19, 22, 31, 5)
     response = client.post(
         "/search/object",
-        json={
-            "camera_id": "1",
-            "start_timestamp": timestamp.isoformat(),
-            "object_id": 42,
-            "search_duration_seconds": 0,
+        data={
+            "timestamp": timestamp.isoformat(),
+            "channel": "1",
+            "bbox_x": "100.0",
+            "bbox_y": "200.0",
+            "bbox_width": "50.0",
+            "bbox_height": "80.0",
             "object_label": "person",
-            "object_bbox": {"x": 100.0, "y": 200.0, "width": 50.0, "height": 80.0},
-            "object_confidence": 0.95,
+            "object_confidence": "0.95",
+            "search_duration_seconds": "0",
         },
     )
 
@@ -656,14 +660,16 @@ def test_search_object_duration_too_long(mock_nvr_client, client):
     timestamp = datetime(2026, 2, 19, 22, 31, 5)
     response = client.post(
         "/search/object",
-        json={
-            "camera_id": "1",
-            "start_timestamp": timestamp.isoformat(),
-            "object_id": 42,
-            "search_duration_seconds": 10801,
+        data={
+            "timestamp": timestamp.isoformat(),
+            "channel": "1",
+            "bbox_x": "100.0",
+            "bbox_y": "200.0",
+            "bbox_width": "50.0",
+            "bbox_height": "80.0",
             "object_label": "person",
-            "object_bbox": {"x": 100.0, "y": 200.0, "width": 50.0, "height": 80.0},
-            "object_confidence": 0.95,
+            "object_confidence": "0.95",
+            "search_duration_seconds": "10801",
         },
     )
 
@@ -675,46 +681,58 @@ def test_search_object_missing_required_fields(client):
     """Test validation error when required fields are missing.
 
     Verifies:
+    - Returns HTTP 422 for missing bbox coordinates
     - Returns HTTP 422 for missing object_label
-    - Returns HTTP 422 for missing object_bbox
-    - Returns HTTP 422 for missing object_confidence
     """
     timestamp = datetime(2026, 2, 19, 22, 31, 5)
-    base_request = {
-        "camera_id": "1",
-        "start_timestamp": timestamp.isoformat(),
-        "object_id": 42,
-        "search_duration_seconds": 3600,
-    }
+
+    # Test missing bbox_x
+    response_no_bbox_x = client.post(
+        "/search/object",
+        data={
+            "timestamp": timestamp.isoformat(),
+            "channel": "1",
+            "bbox_y": "200.0",
+            "bbox_width": "50.0",
+            "bbox_height": "80.0",
+            "object_label": "person",
+            "object_confidence": "0.95",
+            "search_duration_seconds": "3600",
+        },
+    )
+    assert response_no_bbox_x.status_code == 422
 
     # Test missing object_label
     response_no_label = client.post(
         "/search/object",
-        json={
-            **base_request,
-            "object_bbox": {"x": 100.0, "y": 200.0, "width": 50.0, "height": 80.0},
-            "object_confidence": 0.95,
+        data={
+            "timestamp": timestamp.isoformat(),
+            "channel": "1",
+            "bbox_x": "100.0",
+            "bbox_y": "200.0",
+            "bbox_width": "50.0",
+            "bbox_height": "80.0",
+            "object_confidence": "0.95",
+            "search_duration_seconds": "3600",
         },
     )
     assert response_no_label.status_code == 422
 
-    # Test missing object_bbox
-    response_no_bbox = client.post(
+    # Test missing timestamp
+    response_no_timestamp = client.post(
         "/search/object",
-        json={**base_request, "object_label": "person", "object_confidence": 0.95},
-    )
-    assert response_no_bbox.status_code == 422
-
-    # Test missing object_confidence
-    response_no_confidence = client.post(
-        "/search/object",
-        json={
-            **base_request,
+        data={
+            "channel": "1",
+            "bbox_x": "100.0",
+            "bbox_y": "200.0",
+            "bbox_width": "50.0",
+            "bbox_height": "80.0",
             "object_label": "person",
-            "object_bbox": {"x": 100.0, "y": 200.0, "width": 50.0, "height": 80.0},
+            "object_confidence": "0.95",
+            "search_duration_seconds": "3600",
         },
     )
-    assert response_no_confidence.status_code == 422
+    assert response_no_timestamp.status_code == 422
 
 
 

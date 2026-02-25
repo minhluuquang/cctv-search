@@ -31,7 +31,8 @@ export function DetectionWorkspace() {
   const [playbackStartTime, setPlaybackStartTime] = useState(() => {
     const now = new Date();
     now.setMinutes(now.getMinutes() - 5);
-    return now.toISOString();
+    // Format as YYYY-MM-DDTHH:MM:SS in local time
+    return formatDateToLocalISO(now).replace(/\.\d{3}$/, '');
   });
   
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
@@ -46,6 +47,16 @@ export function DetectionWorkspace() {
   const [selectedObjects, setSelectedObjects] = useState<DetectedObject[]>([]);
   const [hoveredObject, setHoveredObject] = useState<DetectedObject | null>(null);
   const [isStripExpanded, setIsStripExpanded] = useState(false);
+  const [searchingObjectId, setSearchingObjectId] = useState<number | null>(null);
+  
+  // Track search results per object (object_id -> first_seen_timestamp)
+  const [searchResults, setSearchResults] = useState<Map<number, Date>>(new Map());
+  
+  // Mini player state
+  const [miniPlayerObjectId, setMiniPlayerObjectId] = useState<number | null>(null);
+  const [miniPlayerStreamUrl, setMiniPlayerStreamUrl] = useState<string | null>(null);
+  const [miniPlayerPlaybackStart, setMiniPlayerPlaybackStart] = useState<Date>(new Date());
+  const [isMiniPlayerLoading, setIsMiniPlayerLoading] = useState(false);
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -122,7 +133,7 @@ export function DetectionWorkspace() {
           setIsStreamLoading(false);
           toast.error("Stream failed to start", { description: "Timeout waiting for stream" });
         }
-      } catch (error) {
+      } catch (_error) {
         attempts++;
         if (attempts < maxAttempts) {
           setTimeout(checkReady, 1000);
@@ -294,19 +305,115 @@ export function DetectionWorkspace() {
   }, []);
 
   // Handle box action for a specific object
-  const handleBoxAction = useCallback((objectId: number, actionId: string) => {
+  const handleBoxAction = useCallback(async (objectId: number, actionId: string) => {
     const object = selectedObjects.find(obj => obj.object_id === objectId);
     if (!object) return;
 
     switch (actionId) {
       case 'search':
-        // TODO: Implement search logic
-        console.log('Search for', object.label, object.object_id);
+        // Set loading state
+        setSearchingObjectId(objectId);
+        toast.info(`Searching for ${object.label}...`, {
+          description: 'This may take a few minutes',
+          duration: 5000,
+        });
+
+        try {
+          // Prepare FormData with object data (from detection)
+          const formData = new FormData();
+          const timestamp = getFrameTimestamp();
+          // Format as YYYY-MM-DDTHH:MM:SS in local time (not UTC)
+          const localTimestamp = formatDateToLocalISO(timestamp).replace(/\.\d{3}$/, '');
+          formData.append('timestamp', localTimestamp);
+          formData.append('channel', CHANNEL.toString());
+          formData.append('bbox_x', object.bbox.x.toString());
+          formData.append('bbox_y', object.bbox.y.toString());
+          formData.append('bbox_width', object.bbox.width.toString());
+          formData.append('bbox_height', object.bbox.height.toString());
+          formData.append('object_label', object.label);
+          formData.append('object_confidence', object.confidence.toString());
+          formData.append('search_duration_seconds', '3600');
+
+          // Call API
+          const response = await fetch(`${API_BASE_URL}/search/object`, {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
+            throw new Error(errorData.detail || 'Search failed');
+          }
+
+          const data = await response.json();
+          
+          if (data.status === 'success' && data.result?.found) {
+            const firstSeen = new Date(data.result.first_seen_timestamp);
+            // Store search result for this object
+            setSearchResults(prev => new Map(prev).set(objectId, firstSeen));
+            toast.success(`Found ${object.label}!`, {
+              description: `First appeared at ${firstSeen.toLocaleTimeString()}. Track duration: ${data.result.track_duration_seconds?.toFixed(1)}s`,
+            });
+          } else {
+            toast.warning('Object not found', {
+              description: data.result?.message || 'Could not find object in search window',
+            });
+          }
+        } catch (error) {
+          console.error('Search failed:', error);
+          toast.error('Search failed', {
+            description: error instanceof Error ? error.message : 'Unknown error',
+          });
+        } finally {
+          setSearchingObjectId(null);
+        }
         break;
-      case 'playback':
-        // TODO: Implement -15s playback logic
-        console.log('Playback -15s for', object.label, object.object_id);
+      case 'playback': {
+        const firstSeen = searchResults.get(objectId);
+        if (!firstSeen) {
+          toast.error('Search result not available');
+          return;
+        }
+        
+        // Calculate start time (15 seconds before first_seen)
+        const playbackStart = new Date(firstSeen.getTime() - 15 * 1000);
+        
+        // Set mini player playback start time
+        setMiniPlayerPlaybackStart(playbackStart);
+        
+        // Open mini player for this object
+        setMiniPlayerObjectId(objectId);
+        setIsMiniPlayerLoading(true);
+        
+        // Start playback stream
+        try {
+          // Format playback start time in local timezone
+          const localPlaybackStart = formatDateToLocalISO(playbackStart).replace(/\.\d{3}$/, '');
+          
+          const response = await fetch(`${API_BASE_URL}/stream/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              channel: CHANNEL,
+              start_time: localPlaybackStart,
+            }),
+          });
+          
+          if (!response.ok) {
+            throw new Error('Failed to start playback stream');
+          }
+          
+          const data: StreamStartResponse = await response.json();
+          setMiniPlayerStreamUrl(`${API_BASE_URL}${data.playlist_url}`);
+        } catch (error) {
+          console.error('Failed to start mini player:', error);
+          toast.error('Failed to start playback');
+          setMiniPlayerObjectId(null);
+        } finally {
+          setIsMiniPlayerLoading(false);
+        }
         break;
+      }
       case 'details':
         // Object details shown via UI
         console.log('Details for', object.label, object.object_id);
@@ -315,7 +422,54 @@ export function DetectionWorkspace() {
         setSelectedObjects(prev => prev.filter(obj => obj.object_id !== objectId));
         break;
     }
-  }, [selectedObjects]);
+  }, [selectedObjects, getFrameTimestamp, searchResults]);
+
+  // Close mini player
+  const handleCloseMiniPlayer = useCallback(() => {
+    setMiniPlayerObjectId(null);
+    setMiniPlayerStreamUrl(null);
+  }, []);
+
+  // Handle seek - restart stream at new time
+  const handleSeek = useCallback(async (time: Date) => {
+    if (!isStreamStarted) return;
+
+    // Update playback start time
+    const formattedTime = formatDateToLocalISO(time).replace(/\.\d{3}$/, '');
+    setPlaybackStartTime(formattedTime);
+
+    // Restart stream at new time
+    try {
+      // Stop current HLS if exists
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+
+      const response = await fetch(`${API_BASE_URL}/stream/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel: CHANNEL,
+          start_time: formattedTime,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to seek stream");
+      }
+
+      const data: StreamStartResponse = await response.json();
+      const fullUrl = `${API_BASE_URL}${data.playlist_url}`;
+      setStreamUrl(fullUrl);
+      
+      // Setup HLS with new URL
+      pollStreamReady(fullUrl);
+    } catch (error) {
+      console.error("Failed to seek:", error);
+      toast.error("Failed to seek");
+    }
+  }, [isStreamStarted, pollStreamReady]);
 
   return (
     <div className="fixed inset-0 bg-black flex flex-col">
@@ -341,12 +495,21 @@ export function DetectionWorkspace() {
           isWaitingForStream={isWaitingForStream}
           isObjectDetectionLoading={isObjectDetectionLoading}
           streamMode={streamMode}
+          playbackStartTime={new Date(playbackStartTime)}
           videoRef={videoRef}
           isExpanded={isStripExpanded}
           previewObject={hoveredObject}
           selectedObjects={selectedObjects}
           detectedObjects={detectedObjects}
+          searchingObjectId={searchingObjectId}
+          searchResults={searchResults}
+          miniPlayerObjectId={miniPlayerObjectId}
+          miniPlayerStreamUrl={miniPlayerStreamUrl}
+          miniPlayerPlaybackStart={miniPlayerPlaybackStart}
+          isMiniPlayerLoading={isMiniPlayerLoading}
           onBoxAction={handleBoxAction}
+          onCloseMiniPlayer={handleCloseMiniPlayer}
+          onSeek={handleSeek}
         />
       </div>
 
